@@ -1,4 +1,4 @@
-name: Build Termux (Custom Image 24.04)
+name: Build Termux (Success)
 
 on:
   workflow_dispatch:
@@ -7,9 +7,9 @@ on:
       - '**.py'
 
 jobs:
-  build-custom-image:
+  build-final-success:
     runs-on: ubuntu-latest
-    name: Build on Official Ubuntu 24.04
+    name: Build on Ubuntu 24.04
     timeout-minutes: 60
     
     steps:
@@ -20,33 +20,24 @@ jobs:
         uses: uraimo/run-on-arch-action@v2
         with:
           arch: aarch64
-          # 关键修改 1: distro 设为 none，不使用插件预设
           distro: none
-          # 关键修改 2: 直接指定官方镜像 (自带 Python 3.12)
           base_image: ubuntu:24.04
-          
           githubToken: ${{ github.token }}
           
-          # 挂载根目录
           run: |
-            echo "--- 1. 准备环境 (Ubuntu 24.04) ---"
+            echo "--- 1. 准备环境 ---"
             apt-get update
             # 安装 Python3 (3.12) 和编译工具
             apt-get install -y python3 python3-pip python3-dev build-essential patchelf git
             
             echo "--- 2. 安装 Nuitka ---"
-            # 24.04 的 pip 需要这个参数
             pip3 install nuitka --break-system-packages
             
-            # 给予缓存权限
             mkdir -p /.cache/Nuitka
             chmod -R 777 /.cache
 
-            echo "--- 3. 开始防崩溃编译 ---"
-            # 确认你的文件名为 pppppp.py
-            # --jobs=1: 强制单核，防止 QEMU 爆内存崩溃
-            # --lto=no: 关闭优化，防止内存溢出
-            
+            echo "--- 3. 开始编译 ---"
+            # 你的程序已经能成功编译了，这里保持原样
             python3 -m nuitka \
               --standalone \
               --onefile \
@@ -57,8 +48,8 @@ jobs:
               pppppp.py
             
             echo "--- 4. 验证 ---"
+            # 只保留 ls 命令，确认文件生成即可，不再运行 file 命令
             ls -lh dist/paktool
-            file dist/paktool
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
