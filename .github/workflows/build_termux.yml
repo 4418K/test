@@ -1,4 +1,4 @@
-name: Build Termux ELF (StaticX Fixed)
+name: Build Termux (Glibc + gcompat)
 
 on:
   workflow_dispatch:
@@ -7,58 +7,52 @@ on:
       - '**.py'
 
 jobs:
-  build-staticx-fixed:
+  build-glibc-binary:
     runs-on: ubuntu-latest
-    name: Build via StaticX (Fixed Deps)
+    name: Build Standard ELF (Ubuntu)
     
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      # 改用 Ubuntu 环境，这里的软件源非常稳，不会像 Alpine 那样缺包或需要编译
       - name: Run Build in QEMU
         uses: uraimo/run-on-arch-action@v2
         with:
           arch: aarch64
-          distro: alpine_latest
+          distro: ubuntu20.04  # 使用 Ubuntu 而不是 Alpine
           githubToken: ${{ github.token }}
           
-          # 挂载根目录
           run: |
-            echo "--- 1. 安装系统依赖 (关键步骤) ---"
-            apk update
-            # 关键修改：
-            # 1. 显式安装 scons (避免 pip 编译失败)
-            # 2. 显式安装 linux-headers (编译 C 程序必须)
-            apk add python3 python3-dev py3-pip build-base patchelf scons linux-headers libffi-dev zlib-dev openssl-dev
+            echo "--- 1. 更新源并安装依赖 ---"
+            # 这里的 apt 安装非常稳定
+            apt-get update
+            apt-get install -y python3 python3-pip python3-dev build-essential patchelf git
             
-            echo "--- 2. 升级 pip 并安装 StaticX ---"
-            # 升级 pip 以避免旧版 wheel 构建问题
-            pip3 install --upgrade pip setuptools wheel --break-system-packages
+            echo "--- 2. 安装 Nuitka ---"
+            # Ubuntu 下 pip 安装通常有现成的 wheel，速度快且不崩
+            pip3 install nuitka --break-system-packages
             
-            # 安装 Nuitka 和 StaticX
-            # 因为系统已经装了 scons，这里安装 staticx 就会顺利通过
-            pip3 install nuitka staticx --break-system-packages
+            # 修正 Nuitka 缓存目录权限 (防止偶尔的权限报错)
+            mkdir -p /.cache/Nuitka
+            chmod -R 777 /.cache
 
-            echo "--- 3. Nuitka 初步编译 (动态版) ---"
+            echo "--- 3. 开始编译 ---"
+            # 生成标准的 Linux 可执行文件
             python3 -m nuitka \
               --standalone \
               --onefile \
-              --lto=no \
               --output-dir=dist \
-              --output-filename=paktool_dynamic \
+              --output-filename=paktool \
               A_Main_new.py
             
-            echo "--- 4. StaticX 打包 (生成最终版) ---"
-            # 使用 staticx 将动态库卷入 exe
-            staticx --strip dist/paktool_dynamic dist/paktool
-            
-            echo "--- 5. 验证 ---"
+            echo "--- 4. 验证 ---"
             ls -lh dist/paktool
             file dist/paktool
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: paktool-termux-aarch64
+          name: paktool-termux-glibc
           path: dist/paktool
-          compression-level: 0
+          compression-level: 9
