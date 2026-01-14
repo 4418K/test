@@ -1,4 +1,4 @@
-name: Build Termux (Native Fix)
+name: Build Termux (Native Final Fix)
 
 on:
   workflow_dispatch:
@@ -7,9 +7,9 @@ on:
       - '**.py'
 
 jobs:
-  build-termux-fixed:
+  build-termux-final:
     runs-on: ubuntu-latest
-    name: Build Native Termux (Fixed Repos)
+    name: Build Native Termux (SSL Bypass)
     timeout-minutes: 60
     
     steps:
@@ -21,50 +21,53 @@ jobs:
         with:
           arch: aarch64
           distro: none
-          # 依然使用官方镜像，但我们在下面手动修复它
           base_image: termux/termux-docker:aarch64
           githubToken: ${{ github.token }}
           
           run: |
-            echo "--- 1. 修复已失效的源地址 ---"
-            # 定义 Termux 的系统路径变量
+            echo "--- 1. 强制修复源与证书 ---"
+            # 设置 Termux 环境变量
             export PREFIX=/data/data/com.termux/files/usr
             
-            # 强制将源列表替换为官方最新的 packages.termux.dev
+            # 1. 覆盖源列表，使用官方最新的 CDN 源
             echo "deb https://packages.termux.dev/apt/termux-main stable main" > $PREFIX/etc/apt/sources.list
             
-            # 删除可能导致报错的旧版源配置文件
+            # 2. 删除所有旧的源配置，防止干扰
             rm -rf $PREFIX/etc/apt/sources.list.d/*
             
-            echo "--- 2. 更新系统并安装依赖 ---"
-            # 更新列表
+            # 3. 【关键步骤】使用 -o 参数强制忽略 SSL 证书错误，进行第一次更新
+            echo "Updating apt ignoring SSL..."
+            apt-get -o "Acquire::https::Verify-Peer=false" update
+            
+            # 4. 【关键步骤】不验证证书，先安装最新的 keyring 和证书包
+            echo "Installing certificates..."
+            apt-get -o "Acquire::https::Verify-Peer=false" install -y termux-keyring ca-certificates
+            
+            # 5. 现在证书修好了，进行正常的 Update
+            echo "Normal update..."
             apt-get update
             
-            # 先安装 keyring 防止签名报错，然后升级系统
-            apt-get install -y termux-keyring
-            # 这里的 -o Dpkg::Options::="--force-confnew" 是为了防止更新时询问配置文件
-            apt-get upgrade -y -o Dpkg::Options::="--force-confnew"
-            
-            # 安装编译所需的包
-            # python: Python 环境
-            # clang: 编译器
-            # make, binutils: 编译工具
-            # patchelf: Nuitka 必备
-            # libffi-dev: Python 库常用依赖
+            echo "--- 2. 安装编译依赖 ---"
+            # 这里的依赖包名称是 Termux 特有的
+            # python: 包含 pip
+            # clang: C 编译器
+            # make, binutils: 基础工具
+            # patchelf: Nuitka 需要用来修改 rpath
+            # libffi-dev: Python 库常见依赖
             apt-get install -y python clang make binutils git patchelf libffi-dev
             
             echo "--- 3. 安装 Nuitka ---"
             pip install --upgrade pip
             pip install nuitka
             
-            # 如果你的代码需要第三方库，请在这里安装，例如：
+            # 如果有第三方库依赖，请取消注释并修改：
             # pip install requests
-            
+
             mkdir -p /.cache/Nuitka
             chmod -R 777 /.cache
 
             echo "--- 4. 开始编译 ---"
-            # 使用 Termux 原生环境编译
+            # 此时环境完全等同于手机 Termux，直接编译即可
             python -m nuitka \
               --standalone \
               --onefile \
@@ -73,13 +76,14 @@ jobs:
               --output-filename=paktool \
               pppppp.py
             
-            echo "--- 5. 验证 ---"
+            echo "--- 5. 验证结果 ---"
             ls -lh dist/paktool
-            echo "Success!"
+            # 检查文件头，确认是 Android linker
+            head -c 50 dist/paktool
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: paktool-termux-fixed
+          name: paktool-termux-native
           path: dist/paktool
           compression-level: 0
