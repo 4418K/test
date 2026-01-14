@@ -1,4 +1,4 @@
-name: Build Termux Static ELF (Source Build)
+name: Build Termux Static ELF (Stable)
 
 on:
   workflow_dispatch:
@@ -7,9 +7,11 @@ on:
       - '**.py'
 
 jobs:
-  build-static-from-source:
+  build-static-stable:
     runs-on: ubuntu-latest
-    name: Build Static Python & Nuitka
+    name: Build Static Python (Single Thread)
+    # 设置超时防止卡死
+    timeout-minutes: 60
     
     steps:
       - name: Checkout Code
@@ -25,59 +27,55 @@ jobs:
           # 挂载根目录
           run: |
             echo "--- 1. 安装编译工具 ---"
-            # 移除不存在的 python3-static，安装编译 Python 源码所需的工具
             apk update
             apk add build-base git patchelf libffi-dev zlib-dev openssl-dev linux-headers curl
             
-            echo "--- 2. 下载并编译静态 Python (版本 3.10) ---"
-            # 这是为了得到 libpython3.10.a
+            echo "--- 2. 下载 Python 3.10 源码 ---"
             cd /tmp
             curl -O https://www.python.org/ftp/python/3.10.13/Python-3.10.13.tgz
             tar xzf Python-3.10.13.tgz
             cd Python-3.10.13
             
-            # 关键配置：--disable-shared (生成静态库)
-            # --with-optimizations 会很慢，这里不加，以加快速度
+            echo "--- 3. 配置编译参数 ---"
+            # --disable-shared: 生成静态库 (.a)
+            # --without-ensurepip: 暂时不装pip，后面单独装，减少出错概率
             ./configure \
                 --prefix=/usr/local \
                 --disable-shared \
-                --with-ensurepip=install \
-                --enable-ipv6
+                --enable-ipv6 \
+                --with-lto=no
             
-            echo "正在编译 Python (这可能需要10分钟)..."
-            make -j$(nproc)
+            echo "--- 4. 编译 Python (关键一步) ---"
+            echo "⚠️ 注意：为了防止 QEMU 崩溃，这里强制使用单线程编译 (make -j1)"
+            echo "⚠️ 这将花费较长时间 (约15-25分钟)，请耐心等待..."
+            
+            # 关键修改：去掉 -j$(nproc)，只用 -j1
+            make -j1
             make install
-            
-            # 验证静态库是否存在
-            if [ -f "/usr/local/lib/libpython3.10.a" ]; then
-                echo "✅ 静态库构建成功！"
-            else
-                echo "❌ 静态库构建失败"
-                exit 1
-            fi
             
             # 回到项目目录
             cd $GITHUB_WORKSPACE
             
-            echo "--- 3. 安装 Nuitka ---"
-            # 使用刚才编译好的 pip3.10
+            echo "--- 5. 安装 Nuitka ---"
+            # 此时 /usr/local/bin/python3 已经是我们刚编译的版本
+            /usr/local/bin/python3 -m ensurepip
             /usr/local/bin/python3 -m pip install nuitka --no-cache-dir
 
-            echo "--- 4. 开始 Nuitka 静态编译 ---"
+            echo "--- 6. 开始 Nuitka 静态打包 ---"
             export LDFLAGS="-static"
             
-            # 使用编译好的静态 Python 运行 Nuitka
+            # 同样，Nuitka 也要限制并行数，防止链接时崩溃
             /usr/local/bin/python3 -m nuitka \
               --standalone \
               --onefile \
               --static-libpython=yes \
               --lto=no \
-              --jobs=$(nproc) \
+              --jobs=1 \
               --output-dir=dist \
               --output-filename=paktool \
               pppppp.py
             
-            echo "--- 5. 验证结果 ---"
+            echo "--- 7. 验证 ---"
             ls -lh dist/paktool
             file dist/paktool
 
