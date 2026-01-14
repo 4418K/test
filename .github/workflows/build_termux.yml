@@ -1,4 +1,4 @@
-name: Build Termux (Docker Buildx)
+name: Build Termux (Final Robust)
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ on:
       - '**.py'
 
 jobs:
-  build-termux-pro:
+  build-termux-final-v2:
     runs-on: ubuntu-latest
     name: Build ARM64 Static Binary
     
@@ -15,81 +15,67 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 1. 配置 QEMU 模拟器 (用于支持 ARM64)
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
-      # 2. 配置 Docker Buildx (跨平台构建工具)
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # 3. 动态生成 Dockerfile
-      # 我们将构建步骤全部写在 Dockerfile 里，确保环境绝对隔离且纯净
       - name: Create Dockerfile
         run: |
           cat <<EOF > Dockerfile
-          # 强制使用 ARM64 的 Alpine 镜像
           FROM python:3.11-alpine
           
-          # 安装编译依赖
-          # build-base: GCC编译器
-          # scons: StaticX 需要
-          # patchelf: Nuitka 需要
+          # 1. 安装环境
           RUN apk add --no-cache build-base git patchelf scons libffi-dev zlib-dev openssl-dev
-          
-          # 安装 Python 工具
           RUN pip install --upgrade pip
           RUN pip install nuitka staticx
           
           WORKDIR /app
-          
-          # 复制源代码
           COPY pppppp.py .
           
-          # 步骤 A: 使用 Nuitka 编译成 Standalone (文件夹模式)
-          # 注意：不要用 --onefile，因为 Termux 对 /tmp 挂载和 FUSE 支持不好
-          # 我们先生成一个依赖 musl 的动态文件夹，再用 StaticX 打包
+          # 2. Nuitka 编译 (不指定 filename，使用默认 pppppp)
+          # 这样输出目录一定是 build/pppppp.dist/pppppp
           RUN python -m nuitka \
               --standalone \
               --lto=no \
               --output-dir=build \
-              --output-filename=paktool-raw \
               pppppp.py
-              
-          # 步骤 B: 使用 StaticX 将文件夹打包成单一静态文件
-          # 这会将所有依赖库（包括 python 运行时和 musl libc）都塞进一个文件
-          RUN staticx build/paktool-raw.dist/paktool-raw /app/paktool
           
-          # 验证生成的文件类型 (在容器内验证)
+          # 3. 【关键步骤】列出文件结构，防止路径猜错
+          RUN echo "--- Debug: List all files in build directory ---" && ls -R build
+          
+          # 4. StaticX 打包
+          # 我们使用 find 命令自动查找 build 目录下的可执行文件，避免路径写死错误
+          # -type f: 找文件
+          # -perm +0111: 找可执行文件 (二进制)
+          # ! -name "*.so": 排除库文件
+          RUN TARGET_BIN=\$(find build -type f -name "pppppp") && \
+              echo "Found target binary at: \$TARGET_BIN" && \
+              staticx \$TARGET_BIN /app/paktool
+          
+          # 5. 验证
           RUN apk add file && file /app/paktool
           EOF
 
-      # 4. 执行构建
       - name: Build and Export
         run: |
-          echo "--- 开始构建 ARM64 镜像 ---"
-          # 使用 buildx 构建，指定平台为 linux/arm64
-          # --load 表示构建完成后加载到本地 Docker daemon，以便我们要提取文件
+          echo "--- Building for ARM64 ---"
+          # 强制指定平台 linux/arm64
           docker buildx build --platform linux/arm64 -t termux-builder --load .
           
-          echo "--- 提取编译产物 ---"
-          # 创建一个临时容器
+          echo "--- Extracting Artifact ---"
           docker create --name dummy termux-builder
-          # 将编译好的文件复制出来
           docker cp dummy:/app/paktool ./paktool
-          # 删除临时容器
           docker rm dummy
           
-          echo "--- 修复权限 ---"
-          # 解决 EACCES 报错：将文件所有权改为当前 Runner 用户
+          echo "--- Fixing Permissions ---"
           sudo chown $USER:$USER ./paktool
           chmod +x ./paktool
           
-          echo "--- 最终验证 ---"
           ls -lh ./paktool
           file ./paktool
 
-      # 5. 上传结果
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
