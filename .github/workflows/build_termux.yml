@@ -1,4 +1,4 @@
-name: Build Termux (Native)
+name: Build Termux (Native Fix)
 
 on:
   workflow_dispatch:
@@ -7,9 +7,9 @@ on:
       - '**.py'
 
 jobs:
-  build-termux-native:
+  build-termux-fixed:
     runs-on: ubuntu-latest
-    name: Build Native Termux
+    name: Build Native Termux (Fixed Repos)
     timeout-minutes: 60
     
     steps:
@@ -21,41 +21,50 @@ jobs:
         with:
           arch: aarch64
           distro: none
-          # 使用官方 Termux 镜像，环境与你手机完全一致
+          # 依然使用官方镜像，但我们在下面手动修复它
           base_image: termux/termux-docker:aarch64
           githubToken: ${{ github.token }}
           
-          # 挂载当前目录到容器内
-          install: |
-            # 这里的 install 步骤在 Termux 镜像里可能不适用，留空，直接在 run 里写
-          
           run: |
-            echo "--- 1. 更新源并安装依赖 ---"
-            # Termux 容器使用 apt/pkg
+            echo "--- 1. 修复已失效的源地址 ---"
+            # 定义 Termux 的系统路径变量
+            export PREFIX=/data/data/com.termux/files/usr
+            
+            # 强制将源列表替换为官方最新的 packages.termux.dev
+            echo "deb https://packages.termux.dev/apt/termux-main stable main" > $PREFIX/etc/apt/sources.list
+            
+            # 删除可能导致报错的旧版源配置文件
+            rm -rf $PREFIX/etc/apt/sources.list.d/*
+            
+            echo "--- 2. 更新系统并安装依赖 ---"
+            # 更新列表
             apt-get update
             
-            # 安装核心编译工具
-            # python: 包含 python3 和 pip
-            # clang: Termux 的编译器
-            # make, binutils: 编译辅助
-            # patchelf: Nuitka 需要
-            # git: 常用工具
+            # 先安装 keyring 防止签名报错，然后升级系统
+            apt-get install -y termux-keyring
+            # 这里的 -o Dpkg::Options::="--force-confnew" 是为了防止更新时询问配置文件
+            apt-get upgrade -y -o Dpkg::Options::="--force-confnew"
+            
+            # 安装编译所需的包
+            # python: Python 环境
+            # clang: 编译器
+            # make, binutils: 编译工具
+            # patchelf: Nuitka 必备
+            # libffi-dev: Python 库常用依赖
             apt-get install -y python clang make binutils git patchelf libffi-dev
             
-            echo "--- 2. 安装 Nuitka ---"
-            # 升级 pip 并安装 nuitka
+            echo "--- 3. 安装 Nuitka ---"
             pip install --upgrade pip
             pip install nuitka
             
-            # 如果你的脚本有依赖 (如 requests)，请在这里安装
+            # 如果你的代码需要第三方库，请在这里安装，例如：
             # pip install requests
             
             mkdir -p /.cache/Nuitka
             chmod -R 777 /.cache
 
-            echo "--- 3. 开始编译 ---"
-            # 注意：不再需要 --static-libpython=yes
-            # 因为我们是在 Termux 原生环境编译，动态链接也是链接到 Android 的库，完全没问题
+            echo "--- 4. 开始编译 ---"
+            # 使用 Termux 原生环境编译
             python -m nuitka \
               --standalone \
               --onefile \
@@ -64,13 +73,13 @@ jobs:
               --output-filename=paktool \
               pppppp.py
             
-            echo "--- 4. 验证 ---"
+            echo "--- 5. 验证 ---"
             ls -lh dist/paktool
-            echo "Build finished!"
+            echo "Success!"
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: paktool-termux-native
+          name: paktool-termux-fixed
           path: dist/paktool
           compression-level: 0
