@@ -1,4 +1,4 @@
-name: Build Termux Static ELF (Stable)
+name: Build Termux ELF (StaticX)
 
 on:
   workflow_dispatch:
@@ -7,11 +7,9 @@ on:
       - '**.py'
 
 jobs:
-  build-static-stable:
+  build-staticx-binary:
     runs-on: ubuntu-latest
-    name: Build Static Python (Single Thread)
-    # 设置超时防止卡死
-    timeout-minutes: 60
+    name: Build via StaticX
     
     steps:
       - name: Checkout Code
@@ -26,62 +24,40 @@ jobs:
           
           # 挂载根目录
           run: |
-            echo "--- 1. 安装编译工具 ---"
+            echo "--- 1. 安装基础环境 (Alpine) ---"
+            # 只需要安装普通的 python3 (动态库)，这几秒钟就能装好
             apk update
-            apk add build-base git patchelf libffi-dev zlib-dev openssl-dev linux-headers curl
+            apk add python3 python3-dev py3-pip build-base patchelf scons libffi-dev zlib-dev openssl-dev
             
-            echo "--- 2. 下载 Python 3.10 源码 ---"
-            cd /tmp
-            curl -O https://www.python.org/ftp/python/3.10.13/Python-3.10.13.tgz
-            tar xzf Python-3.10.13.tgz
-            cd Python-3.10.13
-            
-            echo "--- 3. 配置编译参数 ---"
-            # --disable-shared: 生成静态库 (.a)
-            # --without-ensurepip: 暂时不装pip，后面单独装，减少出错概率
-            ./configure \
-                --prefix=/usr/local \
-                --disable-shared \
-                --enable-ipv6 \
-                --with-lto=no
-            
-            echo "--- 4. 编译 Python (关键一步) ---"
-            echo "⚠️ 注意：为了防止 QEMU 崩溃，这里强制使用单线程编译 (make -j1)"
-            echo "⚠️ 这将花费较长时间 (约15-25分钟)，请耐心等待..."
-            
-            # 关键修改：去掉 -j$(nproc)，只用 -j1
-            make -j1
-            make install
-            
-            # 回到项目目录
-            cd $GITHUB_WORKSPACE
-            
-            echo "--- 5. 安装 Nuitka ---"
-            # 此时 /usr/local/bin/python3 已经是我们刚编译的版本
-            /usr/local/bin/python3 -m ensurepip
-            /usr/local/bin/python3 -m pip install nuitka --no-cache-dir
+            echo "--- 2. 安装构建工具 ---"
+            # 安装 Nuitka 和 StaticX
+            pip3 install nuitka staticx --break-system-packages
 
-            echo "--- 6. 开始 Nuitka 静态打包 ---"
-            export LDFLAGS="-static"
-            
-            # 同样，Nuitka 也要限制并行数，防止链接时崩溃
-            /usr/local/bin/python3 -m nuitka \
+            echo "--- 3. Nuitka 初步编译 (生成动态链接程序) ---"
+            # 这里不使用 --static-libpython=yes，因为我们用系统的动态库
+            python3 -m nuitka \
               --standalone \
               --onefile \
-              --static-libpython=yes \
-              --lto=no \
-              --jobs=1 \
               --output-dir=dist \
-              --output-filename=paktool \
-              pppppp.py
+              --output-filename=paktool_dynamic \
+              A_Main_new.py
             
-            echo "--- 7. 验证 ---"
+            echo "验证中间产物..."
+            file dist/paktool_dynamic
+            # 此时这个文件在 Termux 上运行会报错缺库，所以我们需要下一步
+            
+            echo "--- 4. 使用 StaticX 打包系统库 ---"
+            # StaticX 会把所有依赖的 .so 文件（包括 python 和 musl）全部卷进 exe 里
+            # --strip 用于减小体积
+            staticx --strip dist/paktool_dynamic dist/paktool
+            
+            echo "--- 5. 验证最终结果 ---"
             ls -lh dist/paktool
             file dist/paktool
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: paktool-static-aarch64
+          name: paktool-termux-aarch64
           path: dist/paktool
           compression-level: 0
