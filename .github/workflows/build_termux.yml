@@ -1,10 +1,10 @@
 name: Build for Android Termux (Aarch64 Musl)
 
 on:
+  workflow_dispatch: # 允许手动点击按钮触发
   push:
     paths:
-      - '**.py' # 当 py 文件更新时触发
-  workflow_dispatch: # 允许手动点击按钮触发
+      - '**.py'
 
 jobs:
   build-termux-binary:
@@ -12,45 +12,48 @@ jobs:
     name: Build Nuitka ELF on Alpine/Aarch64
     
     steps:
+      # 更新为 v4
       - name: Checkout Code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      # 关键步骤：使用 QEMU 模拟 Aarch64 架构的 Alpine Linux
-      # 这相当于在你的 Github Action 里跑了一个 ARM 架构的虚拟机
+      # 使用 QEMU 模拟手机架构 (Aarch64) + Alpine Linux (Musl Libc)
       - name: Run Build in QEMU
         uses: uraimo/run-on-arch-action@v2
         with:
-          arch: aarch64        # 模拟手机 CPU 架构
-          distro: alpine_latest # 使用 Alpine (自带 Musl Libc)
-          
-          # 挂载当前代码目录到虚拟环境
+          arch: aarch64
+          distro: alpine_latest
           githubToken: ${{ github.token }}
           
-          # 在虚拟环境中执行的命令
+          # 在模拟环境中执行的命令
           run: |
-            # 1. 安装编译依赖 (Alpine使用 apk 包管理器)
-            echo "正在安装依赖..."
+            echo "--- 1. 安装基础编译环境 (Alpine) ---"
+            # build-base 包含了 gcc, musl-dev 等
+            # patchelf 是 Nuitka 打包必须的工具
             apk update
-            apk add python3 python3-dev py3-pip build-base patchelf libffi-dev openssl-dev zlib-dev gcc musl-dev
+            apk add python3 python3-dev py3-pip build-base patchelf libffi-dev openssl-dev zlib-dev
             
-            # 2. 安装 Nuitka 和其他 Python 库
-            # 如果你的脚本有其他依赖(如 requests)，请在这里加上
+            echo "--- 2. 安装 Nuitka ---"
+            # --break-system-packages 是因为新版 Alpine 保护系统 Python
             pip3 install nuitka --break-system-packages
             
-            # 3. 开始编译
-            # --standalone: 打包所有依赖
-            # --onefile: 生成单个可执行文件
-            # 这里的 python3 在 Alpine 下就是链接到 musl 的
-            echo "开始 Nuitka 编译..."
+            # 如果你有其他库 (例如 requests), 请取消下面的注释并修改:
+            # pip3 install requests --break-system-packages
+
+            echo "--- 3. 开始编译 (模拟 Zig Static 效果) ---"
+            # --standalone: 包含所有依赖
+            # --onefile: 生成单文件
+            # 在 Alpine 下编译会自动链接 musl，完美兼容 Termux
             python3 -m nuitka --standalone --onefile --output-dir=dist --output-filename=paktool A_Main_new.py
             
-            # 4. 验证生成
+            echo "--- 4. 检查生成结果 ---"
             ls -lh dist/
-            file dist/paktool
+            # 这里的 file 命令可能需要安装，但 ls 足够确认文件存在
 
-      # 将生成的文件上传供你下载
+      # 关键修改：这里更新为 v4
       - name: Upload Artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: paktool-termux-aarch64
           path: dist/paktool
+          # 设置压缩级别，加快上传速度
+          compression-level: 9
