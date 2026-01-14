@@ -1,4 +1,4 @@
-name: Build Termux (Stable & Low Memory)
+name: Build Termux (Custom Image 24.04)
 
 on:
   workflow_dispatch:
@@ -7,33 +7,35 @@ on:
       - '**.py'
 
 jobs:
-  build-stable-binary:
+  build-custom-image:
     runs-on: ubuntu-latest
-    name: Build on Ubuntu 24.04 (Safe Mode)
-    # 设置超时时间，防止单核编译卡死太久
+    name: Build on Official Ubuntu 24.04
     timeout-minutes: 60
     
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 使用 Ubuntu 24.04 (自带 Python 3.12, 支持你的代码语法)
       - name: Run Build in QEMU
         uses: uraimo/run-on-arch-action@v2
         with:
           arch: aarch64
-          distro: ubuntu24.04
+          # 关键修改 1: distro 设为 none，不使用插件预设
+          distro: none
+          # 关键修改 2: 直接指定官方镜像 (自带 Python 3.12)
+          base_image: ubuntu:24.04
+          
           githubToken: ${{ github.token }}
           
           # 挂载根目录
           run: |
-            echo "--- 1. 准备环境 ---"
+            echo "--- 1. 准备环境 (Ubuntu 24.04) ---"
             apt-get update
-            # 安装基础依赖
+            # 安装 Python3 (3.12) 和编译工具
             apt-get install -y python3 python3-pip python3-dev build-essential patchelf git
             
             echo "--- 2. 安装 Nuitka ---"
-            # 24.04 必须加这个参数
+            # 24.04 的 pip 需要这个参数
             pip3 install nuitka --break-system-packages
             
             # 给予缓存权限
@@ -41,12 +43,9 @@ jobs:
             chmod -R 777 /.cache
 
             echo "--- 3. 开始防崩溃编译 ---"
-            echo "⚠️ 正在使用单线程模式以防止内存溢出，请耐心等待..."
-            
-            # 关键参数解释：
-            # --jobs=1 : 只用1个CPU核心，防止内存撑爆 (关键!)
-            # --lto=no : 关闭链接优化，大幅降低内存消耗 (关键!)
-            # pppppp.py : 你的源代码文件名
+            # 确认你的文件名为 pppppp.py
+            # --jobs=1: 强制单核，防止 QEMU 爆内存崩溃
+            # --lto=no: 关闭优化，防止内存溢出
             
             python3 -m nuitka \
               --standalone \
