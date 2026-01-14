@@ -1,4 +1,4 @@
-name: Build Termux (Glibc + gcompat)
+name: Build Termux (Ubuntu 20.04)
 
 on:
   workflow_dispatch:
@@ -7,33 +7,34 @@ on:
       - '**.py'
 
 jobs:
-  build-glibc-binary:
+  build-ubuntu-binary:
     runs-on: ubuntu-latest
-    name: Build Standard ELF (Ubuntu)
+    name: Build ELF on Ubuntu
     
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 改用 Ubuntu 环境，这里的软件源非常稳，不会像 Alpine 那样缺包或需要编译
+      # 使用 Ubuntu 20.04 环境 (非常稳定)
       - name: Run Build in QEMU
         uses: uraimo/run-on-arch-action@v2
         with:
           arch: aarch64
-          distro: ubuntu20.04  # 使用 Ubuntu 而不是 Alpine
+          distro: ubuntu20.04
           githubToken: ${{ github.token }}
           
           run: |
             echo "--- 1. 更新源并安装依赖 ---"
-            # 这里的 apt 安装非常稳定
             apt-get update
+            # 安装 Python3, pip, 以及编译必须的工具
             apt-get install -y python3 python3-pip python3-dev build-essential patchelf git
             
             echo "--- 2. 安装 Nuitka ---"
-            # Ubuntu 下 pip 安装通常有现成的 wheel，速度快且不崩
-            pip3 install nuitka --break-system-packages
+            # 关键修改：去掉了 --break-system-packages 参数
+            # Ubuntu 20.04 的 pip 不需要这个参数，加上反而会报错
+            pip3 install nuitka
             
-            # 修正 Nuitka 缓存目录权限 (防止偶尔的权限报错)
+            # 修正 Nuitka 缓存目录权限 (防止权限报错)
             mkdir -p /.cache/Nuitka
             chmod -R 777 /.cache
 
