@@ -1,4 +1,4 @@
-﻿import os
+import os
 import shutil
 import sys
 import random
@@ -250,7 +250,8 @@ class Verification:
             print("无法获取工具版本！\n请检查网络设置！")
             return "exit"
         if get_json_value(data.decode("utf-8"), "num") != self.ver:
-            print(f"检测到有新版本请更新！\n当前版本：{self.ver}\n最新版本：{get_json_value(data.decode("utf-8"), "num")}")
+            # 注意：内部的 utf-8 和 num 变成了单引号
+            print(f"检测到有新版本请更新！\n当前版本：{self.ver}\n最新版本：{get_json_value(data.decode('utf-8'), 'num')}")
             print("最新版本下载地址：" + get_json_value(data.decode("utf-8"), "addr"))
             return "new"
         return "ok"
