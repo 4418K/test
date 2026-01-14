@@ -1,4 +1,4 @@
-name: Build Termux (Native Final Fix)
+name: Build Termux (StaticX)
 
 on:
   workflow_dispatch:
@@ -7,83 +7,63 @@ on:
       - '**.py'
 
 jobs:
-  build-termux-final:
+  build-staticx:
     runs-on: ubuntu-latest
-    name: Build Native Termux (SSL Bypass)
+    name: Build Static Executable
     timeout-minutes: 60
     
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Run Build in Termux Container
+      - name: Build in Alpine Container
         uses: uraimo/run-on-arch-action@v2
         with:
           arch: aarch64
-          distro: none
-          base_image: termux/termux-docker:aarch64
+          distro: alpine_latest
+          # 使用 Python 3.11 Alpine 镜像，兼容性最好
+          base_image: python:3.11-alpine
           githubToken: ${{ github.token }}
           
           run: |
-            echo "--- 1. 强制修复源与证书 ---"
-            # 设置 Termux 环境变量
-            export PREFIX=/data/data/com.termux/files/usr
+            echo "--- 1. 安装编译工具 ---"
+            # 安装 gcc (build-base), patchelf (Nuitka需要), scons (StaticX需要)
+            apk update
+            apk add build-base patchelf scons git libffi-dev zlib-dev openssl-dev
             
-            # 1. 覆盖源列表，使用官方最新的 CDN 源
-            echo "deb https://packages.termux.dev/apt/termux-main stable main" > $PREFIX/etc/apt/sources.list
-            
-            # 2. 删除所有旧的源配置，防止干扰
-            rm -rf $PREFIX/etc/apt/sources.list.d/*
-            
-            # 3. 【关键步骤】使用 -o 参数强制忽略 SSL 证书错误，进行第一次更新
-            echo "Updating apt ignoring SSL..."
-            apt-get -o "Acquire::https::Verify-Peer=false" update
-            
-            # 4. 【关键步骤】不验证证书，先安装最新的 keyring 和证书包
-            echo "Installing certificates..."
-            apt-get -o "Acquire::https::Verify-Peer=false" install -y termux-keyring ca-certificates
-            
-            # 5. 现在证书修好了，进行正常的 Update
-            echo "Normal update..."
-            apt-get update
-            
-            echo "--- 2. 安装编译依赖 ---"
-            # 这里的依赖包名称是 Termux 特有的
-            # python: 包含 pip
-            # clang: C 编译器
-            # make, binutils: 基础工具
-            # patchelf: Nuitka 需要用来修改 rpath
-            # libffi-dev: Python 库常见依赖
-            apt-get install -y python clang make binutils git patchelf libffi-dev
-            
-            echo "--- 3. 安装 Nuitka ---"
+            echo "--- 2. 安装 Python 库 ---"
             pip install --upgrade pip
-            pip install nuitka
+            # 安装 Nuitka 和 StaticX
+            pip install nuitka staticx
             
-            # 如果有第三方库依赖，请取消注释并修改：
+            # 如果你的脚本有依赖（如 requests），请在这里安装
             # pip install requests
 
-            mkdir -p /.cache/Nuitka
-            chmod -R 777 /.cache
-
-            echo "--- 4. 开始编译 ---"
-            # 此时环境完全等同于手机 Termux，直接编译即可
+            echo "--- 3. Nuitka 编译 (阶段1) ---"
+            # 先用 Nuitka 编译成依赖 musl 的普通可执行文件
+            # 注意：这里我们不需要 --static-libpython=yes，避免之前的报错
             python -m nuitka \
               --standalone \
               --onefile \
               --jobs=1 \
               --output-dir=dist \
-              --output-filename=paktool \
+              --output-filename=paktool-temp \
               pppppp.py
             
-            echo "--- 5. 验证结果 ---"
+            echo "--- 4. StaticX 打包 (阶段2) ---"
+            # 这一步是核心！将 Nuitka 生成的文件打包成全静态文件
+            # 这样它就不再依赖 /lib/ld-musl-aarch64.so.1 了
+            staticx dist/paktool-temp dist/paktool
+            
+            echo "--- 5. 验证 ---"
             ls -lh dist/paktool
-            # 检查文件头，确认是 Android linker
-            head -c 50 dist/paktool
+            # 验证文件类型，此时它应该是静态链接的
+            apk add file
+            file dist/paktool
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: paktool-termux-native
+          name: paktool-termux-static
           path: dist/paktool
           compression-level: 0
