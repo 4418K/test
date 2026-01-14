@@ -1,4 +1,4 @@
-name: Build Termux (Ubuntu 20.04)
+name: Build Termux (Stable & Low Memory)
 
 on:
   workflow_dispatch:
@@ -7,42 +7,52 @@ on:
       - '**.py'
 
 jobs:
-  build-ubuntu-binary:
+  build-stable-binary:
     runs-on: ubuntu-latest
-    name: Build ELF on Ubuntu
+    name: Build on Ubuntu 24.04 (Safe Mode)
+    # 设置超时时间，防止单核编译卡死太久
+    timeout-minutes: 60
     
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 使用 Ubuntu 20.04 环境 (非常稳定)
+      # 使用 Ubuntu 24.04 (自带 Python 3.12, 支持你的代码语法)
       - name: Run Build in QEMU
         uses: uraimo/run-on-arch-action@v2
         with:
           arch: aarch64
-          distro: ubuntu20.04
+          distro: ubuntu24.04
           githubToken: ${{ github.token }}
           
+          # 挂载根目录
           run: |
-            echo "--- 1. 更新源并安装依赖 ---"
+            echo "--- 1. 准备环境 ---"
             apt-get update
-            # 安装 Python3, pip, 以及编译必须的工具
+            # 安装基础依赖
             apt-get install -y python3 python3-pip python3-dev build-essential patchelf git
             
             echo "--- 2. 安装 Nuitka ---"
-            # 关键修改：去掉了 --break-system-packages 参数
-            # Ubuntu 20.04 的 pip 不需要这个参数，加上反而会报错
-            pip3 install nuitka
+            # 24.04 必须加这个参数
+            pip3 install nuitka --break-system-packages
             
-            # 修正 Nuitka 缓存目录权限 (防止权限报错)
+            # 给予缓存权限
             mkdir -p /.cache/Nuitka
             chmod -R 777 /.cache
 
-            echo "--- 3. 开始编译 ---"
-            # 生成标准的 Linux 可执行文件
+            echo "--- 3. 开始防崩溃编译 ---"
+            echo "⚠️ 正在使用单线程模式以防止内存溢出，请耐心等待..."
+            
+            # 关键参数解释：
+            # --jobs=1 : 只用1个CPU核心，防止内存撑爆 (关键!)
+            # --lto=no : 关闭链接优化，大幅降低内存消耗 (关键!)
+            # pppppp.py : 你的源代码文件名
+            
             python3 -m nuitka \
               --standalone \
               --onefile \
+              --jobs=1 \
+              --lto=no \
               --output-dir=dist \
               --output-filename=paktool \
               pppppp.py
@@ -54,6 +64,6 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: paktool-termux-glibc
+          name: paktool-termux-final
           path: dist/paktool
-          compression-level: 9
+          compression-level: 0
