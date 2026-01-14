@@ -1,4 +1,4 @@
-name: Build for Android Termux (Static Musl)
+name: Build Termux Static ELF (Source Build)
 
 on:
   workflow_dispatch:
@@ -7,9 +7,9 @@ on:
       - '**.py'
 
 jobs:
-  build-static-binary:
+  build-static-from-source:
     runs-on: ubuntu-latest
-    name: Build Static ELF on Alpine
+    name: Build Static Python & Nuitka
     
     steps:
       - name: Checkout Code
@@ -24,26 +24,61 @@ jobs:
           
           # 挂载根目录
           run: |
-            echo "--- 1. 安装静态编译依赖 ---"
+            echo "--- 1. 安装编译工具 ---"
+            # 移除不存在的 python3-static，安装编译 Python 源码所需的工具
             apk update
-            # 关键修改：安装 python3-static 用于静态链接
-            apk add python3 python3-dev py3-pip build-base patchelf python3-static libffi-dev openssl-dev zlib-dev zlib-static
+            apk add build-base git patchelf libffi-dev zlib-dev openssl-dev linux-headers curl
             
-            echo "--- 2. 安装 Nuitka ---"
-            pip3 install nuitka --break-system-packages
+            echo "--- 2. 下载并编译静态 Python (版本 3.10) ---"
+            # 这是为了得到 libpython3.10.a
+            cd /tmp
+            curl -O https://www.python.org/ftp/python/3.10.13/Python-3.10.13.tgz
+            tar xzf Python-3.10.13.tgz
+            cd Python-3.10.13
+            
+            # 关键配置：--disable-shared (生成静态库)
+            # --with-optimizations 会很慢，这里不加，以加快速度
+            ./configure \
+                --prefix=/usr/local \
+                --disable-shared \
+                --with-ensurepip=install \
+                --enable-ipv6
+            
+            echo "正在编译 Python (这可能需要10分钟)..."
+            make -j$(nproc)
+            make install
+            
+            # 验证静态库是否存在
+            if [ -f "/usr/local/lib/libpython3.10.a" ]; then
+                echo "✅ 静态库构建成功！"
+            else
+                echo "❌ 静态库构建失败"
+                exit 1
+            fi
+            
+            # 回到项目目录
+            cd $GITHUB_WORKSPACE
+            
+            echo "--- 3. 安装 Nuitka ---"
+            # 使用刚才编译好的 pip3.10
+            /usr/local/bin/python3 -m pip install nuitka --no-cache-dir
 
-            echo "--- 3. 配置静态编译参数 ---"
-            # 强制 GCC 进行静态链接
+            echo "--- 4. 开始 Nuitka 静态编译 ---"
             export LDFLAGS="-static"
-            # 告诉 Nuitka 使用静态 Python 库
-            export NUITKA_FLAGS="--static-libpython=yes"
-
-            echo "--- 4. 开始静态编译 ---"
-            # 注意：这里假设 A_Main_new.py 在仓库根目录
-            python3 -m nuitka --standalone --onefile $NUITKA_FLAGS --output-dir=dist --output-filename=paktool pppppp.py
             
-            echo "--- 5. 验证文件类型 ---"
-            # 如果成功，file 命令应该显示 "statically linked"
+            # 使用编译好的静态 Python 运行 Nuitka
+            /usr/local/bin/python3 -m nuitka \
+              --standalone \
+              --onefile \
+              --static-libpython=yes \
+              --lto=no \
+              --jobs=$(nproc) \
+              --output-dir=dist \
+              --output-filename=paktool \
+              pppppp.py
+            
+            echo "--- 5. 验证结果 ---"
+            ls -lh dist/paktool
             file dist/paktool
 
       - name: Upload Artifact
@@ -51,4 +86,4 @@ jobs:
         with:
           name: paktool-static-aarch64
           path: dist/paktool
-          compression-level: 9
+          compression-level: 0
