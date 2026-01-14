@@ -45,7 +45,7 @@ jobs:
               --onefile \
               --output-dir=dist \
               --output-filename=paktool \
-              A_Main_new.py
+              pppppp.py
             
             echo "--- 4. 验证 ---"
             ls -lh dist/paktool
