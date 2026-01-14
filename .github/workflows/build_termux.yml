@@ -1,4 +1,4 @@
-name: Build Termux (Success)
+name: Build Termux (Static)
 
 on:
   workflow_dispatch:
@@ -7,53 +7,66 @@ on:
       - '**.py'
 
 jobs:
-  build-final-success:
+  build-static-alpine:
     runs-on: ubuntu-latest
-    name: Build on Ubuntu 24.04
+    name: Build Static on Alpine
     timeout-minutes: 60
     
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Run Build in QEMU
+      - name: Run Build in Alpine QEMU
         uses: uraimo/run-on-arch-action@v2
         with:
           arch: aarch64
-          distro: none
-          base_image: ubuntu:24.04
+          distro: alpine_latest
+          # 使用 Alpine 作为基础镜像，它体积小且容易生成静态文件
+          base_image: python:3.12-alpine
           githubToken: ${{ github.token }}
           
           run: |
-            echo "--- 1. 准备环境 ---"
-            apt-get update
-            # 安装 Python3 (3.12) 和编译工具
-            apt-get install -y python3 python3-pip python3-dev build-essential patchelf git
+            echo "--- 1. 安装编译依赖 ---"
+            # Alpine 使用 apk 包管理器
+            # build-base: 包含 gcc, make 等
+            # libffi-dev, openssl-dev, zlib-dev: Python 常用库依赖
+            # patchelf: Nuitka 需要
+            apk update
+            apk add build-base git patchelf libffi-dev openssl-dev zlib-dev python3-dev
             
             echo "--- 2. 安装 Nuitka ---"
-            pip3 install nuitka --break-system-packages
+            # 在 Alpine 上为了兼容性，建议更新 pip
+            pip3 install --upgrade pip
+            pip3 install nuitka
             
+            # 如果你的 pppppp.py 依赖其他库（例如 requests），请在这里安装
+            # pip3 install requests
+
             mkdir -p /.cache/Nuitka
             chmod -R 777 /.cache
 
-            echo "--- 3. 开始编译 ---"
-            # 你的程序已经能成功编译了，这里保持原样
+            echo "--- 3. 开始静态编译 ---"
+            # 关键参数：--static-libpython=yes
+            # 这会将 Python 运行环境静态打包进 exe，不再依赖系统的 so 文件
             python3 -m nuitka \
               --standalone \
               --onefile \
+              --static-libpython=yes \
               --jobs=1 \
-              --lto=no \
               --output-dir=dist \
               --output-filename=paktool \
               pppppp.py
             
             echo "--- 4. 验证 ---"
-            # 只保留 ls 命令，确认文件生成即可，不再运行 file 命令
+            # 验证生成的文件是否为静态链接
             ls -lh dist/paktool
+            # 运行 file 命令查看文件属性（可选，仅用于调试）
+            apk add file
+            file dist/paktool
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: paktool-termux-final
+          name: paktool-termux-static
           path: dist/paktool
           compression-level: 0
