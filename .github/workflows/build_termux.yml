@@ -1,0 +1,56 @@
+name: Build for Android Termux (Aarch64 Musl)
+
+on:
+  push:
+    paths:
+      - '**.py' # 当 py 文件更新时触发
+  workflow_dispatch: # 允许手动点击按钮触发
+
+jobs:
+  build-termux-binary:
+    runs-on: ubuntu-latest
+    name: Build Nuitka ELF on Alpine/Aarch64
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      # 关键步骤：使用 QEMU 模拟 Aarch64 架构的 Alpine Linux
+      # 这相当于在你的 Github Action 里跑了一个 ARM 架构的虚拟机
+      - name: Run Build in QEMU
+        uses: uraimo/run-on-arch-action@v2
+        with:
+          arch: aarch64        # 模拟手机 CPU 架构
+          distro: alpine_latest # 使用 Alpine (自带 Musl Libc)
+          
+          # 挂载当前代码目录到虚拟环境
+          githubToken: ${{ github.token }}
+          
+          # 在虚拟环境中执行的命令
+          run: |
+            # 1. 安装编译依赖 (Alpine使用 apk 包管理器)
+            echo "正在安装依赖..."
+            apk update
+            apk add python3 python3-dev py3-pip build-base patchelf libffi-dev openssl-dev zlib-dev gcc musl-dev
+            
+            # 2. 安装 Nuitka 和其他 Python 库
+            # 如果你的脚本有其他依赖(如 requests)，请在这里加上
+            pip3 install nuitka --break-system-packages
+            
+            # 3. 开始编译
+            # --standalone: 打包所有依赖
+            # --onefile: 生成单个可执行文件
+            # 这里的 python3 在 Alpine 下就是链接到 musl 的
+            echo "开始 Nuitka 编译..."
+            python3 -m nuitka --standalone --onefile --output-dir=dist --output-filename=paktool A_Main_new.py
+            
+            # 4. 验证生成
+            ls -lh dist/
+            file dist/paktool
+
+      # 将生成的文件上传供你下载
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: paktool-termux-aarch64
+          path: dist/paktool
