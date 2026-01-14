@@ -1,4 +1,4 @@
-name: Build Termux ELF (StaticX)
+name: Build Termux ELF (StaticX Fixed)
 
 on:
   workflow_dispatch:
@@ -7,9 +7,9 @@ on:
       - '**.py'
 
 jobs:
-  build-staticx-binary:
+  build-staticx-fixed:
     runs-on: ubuntu-latest
-    name: Build via StaticX
+    name: Build via StaticX (Fixed Deps)
     
     steps:
       - name: Checkout Code
@@ -24,34 +24,35 @@ jobs:
           
           # 挂载根目录
           run: |
-            echo "--- 1. 安装基础环境 (Alpine) ---"
-            # 只需要安装普通的 python3 (动态库)，这几秒钟就能装好
+            echo "--- 1. 安装系统依赖 (关键步骤) ---"
             apk update
-            apk add python3 python3-dev py3-pip build-base patchelf scons libffi-dev zlib-dev openssl-dev
+            # 关键修改：
+            # 1. 显式安装 scons (避免 pip 编译失败)
+            # 2. 显式安装 linux-headers (编译 C 程序必须)
+            apk add python3 python3-dev py3-pip build-base patchelf scons linux-headers libffi-dev zlib-dev openssl-dev
             
-            echo "--- 2. 安装构建工具 ---"
+            echo "--- 2. 升级 pip 并安装 StaticX ---"
+            # 升级 pip 以避免旧版 wheel 构建问题
+            pip3 install --upgrade pip setuptools wheel --break-system-packages
+            
             # 安装 Nuitka 和 StaticX
+            # 因为系统已经装了 scons，这里安装 staticx 就会顺利通过
             pip3 install nuitka staticx --break-system-packages
 
-            echo "--- 3. Nuitka 初步编译 (生成动态链接程序) ---"
-            # 这里不使用 --static-libpython=yes，因为我们用系统的动态库
+            echo "--- 3. Nuitka 初步编译 (动态版) ---"
             python3 -m nuitka \
               --standalone \
               --onefile \
+              --lto=no \
               --output-dir=dist \
               --output-filename=paktool_dynamic \
               A_Main_new.py
             
-            echo "验证中间产物..."
-            file dist/paktool_dynamic
-            # 此时这个文件在 Termux 上运行会报错缺库，所以我们需要下一步
-            
-            echo "--- 4. 使用 StaticX 打包系统库 ---"
-            # StaticX 会把所有依赖的 .so 文件（包括 python 和 musl）全部卷进 exe 里
-            # --strip 用于减小体积
+            echo "--- 4. StaticX 打包 (生成最终版) ---"
+            # 使用 staticx 将动态库卷入 exe
             staticx --strip dist/paktool_dynamic dist/paktool
             
-            echo "--- 5. 验证最终结果 ---"
+            echo "--- 5. 验证 ---"
             ls -lh dist/paktool
             file dist/paktool
 
