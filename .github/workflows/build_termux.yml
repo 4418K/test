@@ -43,7 +43,7 @@ jobs:
             # --standalone: 包含所有依赖
             # --onefile: 生成单文件
             # 在 Alpine 下编译会自动链接 musl，完美兼容 Termux
-            python3 -m nuitka --standalone --onefile --output-dir=dist --output-filename=paktool A_Main_new.py
+            python3 -m nuitka --standalone --onefile --output-dir=dist --output-filename=paktool pppppp.py
             
             echo "--- 4. 检查生成结果 ---"
             ls -lh dist/
