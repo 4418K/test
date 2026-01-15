@@ -1,4 +1,4 @@
-name: Build Termux (Final Robust)
+name: Build Termux (Android 10+ Universal)
 
 on:
   workflow_dispatch:
@@ -7,78 +7,90 @@ on:
       - '**.py'
 
 jobs:
-  build-termux-final-v2:
+  build-android-universal:
     runs-on: ubuntu-latest
-    name: Build ARM64 Static Binary
+    name: Build Universal ELF for Android
     
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      # 1. 启用 QEMU 处理器模拟 (这是能编译出 ARM64 的关键)
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
+      # 2. 启用 Docker Buildx (跨平台构建引擎)
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Create Dockerfile
+      # 3. 动态生成 Dockerfile
+      # 我们不在 Termux 破旧的镜像里折腾，而是用 Alpine 打造一个全静态环境
+      - name: Generate Dockerfile
         run: |
           cat <<EOF > Dockerfile
+          # 强制使用 ARM64 架构的 Alpine 镜像
           FROM python:3.11-alpine
           
-          # 1. 安装环境
+          # 安装编译工具链
           RUN apk add --no-cache build-base git patchelf scons libffi-dev zlib-dev openssl-dev
+          
+          # 更新 pip 并安装打包工具
           RUN pip install --upgrade pip
           RUN pip install nuitka staticx
           
           WORKDIR /app
           COPY pppppp.py .
           
-          # 2. Nuitka 编译 (不指定 filename，使用默认 pppppp)
-          # 这样输出目录一定是 build/pppppp.dist/pppppp
+          # --- 第一步：Nuitka 编译 ---
+          # 生成独立文件夹 (Standalone)，不依赖系统 Python
+          # 不使用 --onefile 是为了兼容性，后续用 staticx 合并
           RUN python -m nuitka \
               --standalone \
               --lto=no \
               --output-dir=build \
               pppppp.py
           
-          # 3. 【关键步骤】列出文件结构，防止路径猜错
-          RUN echo "--- Debug: List all files in build directory ---" && ls -R build
+          # --- 调试：显示目录结构 (防止找不到文件) ---
+          RUN echo "=== 正在检查编译输出目录 ===" && ls -R build
           
-          # 4. StaticX 打包
-          # 我们使用 find 命令自动查找 build 目录下的可执行文件，避免路径写死错误
-          # -type f: 找文件
-          # -perm +0111: 找可执行文件 (二进制)
-          # ! -name "*.so": 排除库文件
-          RUN TARGET_BIN=\$(find build -type f -name "pppppp") && \
-              echo "Found target binary at: \$TARGET_BIN" && \
-              staticx \$TARGET_BIN /app/paktool
+          # --- 第二步：StaticX 打包 ---
+          # 自动寻找编译出来的二进制文件，不靠猜文件名
+          # 这会将 musl libc 和 python 库全部吸入一个文件
+          RUN \
+            TARGET=\$(find build -type f -perm +0111 ! -name "*.so" | head -n 1) && \
+            echo "Found binary at: \$TARGET" && \
+            staticx \$TARGET /app/paktool
           
-          # 5. 验证
+          # --- 验证：确保是 ARM64 且为静态链接 ---
           RUN apk add file && file /app/paktool
           EOF
 
-      - name: Build and Export
+      # 4. 执行构建 (关键：强制指定 linux/arm64)
+      - name: Build via Docker Buildx
         run: |
-          echo "--- Building for ARM64 ---"
-          # 强制指定平台 linux/arm64
-          docker buildx build --platform linux/arm64 -t termux-builder --load .
+          echo "--- 开始构建 ARM64 镜像 ---"
+          # --platform linux/arm64 保证了生成的是手机版，不是电脑版
+          # --load 表示构建完把镜像加载回来，方便我们要提取文件
+          docker buildx build --platform linux/arm64 -t android-builder --load .
           
-          echo "--- Extracting Artifact ---"
-          docker create --name dummy termux-builder
+          echo "--- 从容器提取文件 ---"
+          docker create --name dummy android-builder
           docker cp dummy:/app/paktool ./paktool
           docker rm dummy
           
-          echo "--- Fixing Permissions ---"
+          echo "--- 检查文件属性 ---"
+          # 修复权限，否则无法上传
           sudo chown $USER:$USER ./paktool
           chmod +x ./paktool
           
+          # 打印文件信息，你应该能看到 "ARM aarch64" 字样
           ls -lh ./paktool
           file ./paktool
 
+      # 5. 上传成品
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: paktool-termux-arm64
+          name: paktool-android-arm64
           path: paktool
           compression-level: 0
