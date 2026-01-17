@@ -38,7 +38,7 @@ jobs:
             cd build_out
             # 把 Nuitka 生成的文件夹打包成 payload.tar.gz
             # 排除可能存在的缓存文件
-            tar --exclude='__pycache__' -czf payload.tar.gz main.dist
+            tar --exclude='__pycache__' -czf payload.tar.gz pppppp.dist
 
             echo "🛠️ 5. Creating C Launcher Source..."
             # 编写 C 语言启动器
