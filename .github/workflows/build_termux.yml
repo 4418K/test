@@ -1,4 +1,4 @@
-name: Build for Termux (Custom ELF)
+name: Build for Termux (Custom ELF Fixed)
 
 on:
   push:
@@ -22,24 +22,27 @@ jobs:
           run: |
             echo "🔥 1. Installing dependencies..."
             apk update
-            # 只需要最基础的工具：Python, GCC, Tar
-            apk add --no-cache python3 python3-dev py3-pip gcc musl-dev make build-base tar
+            # 【修复点】这里加上了 patchelf
+            # Nuitka standalone 模式必须要有 patchelf 才能打包 .so 文件
+            apk add --no-cache python3 python3-dev py3-pip gcc musl-dev make build-base tar patchelf
 
             echo "📦 2. Installing Nuitka..."
             pip3 install nuitka --break-system-packages
 
             echo "🚀 3. Nuitka Compilation..."
             # 生成 standalone 文件夹
+            # 此时源代码已被编译为二进制 .so 文件，完全不可读
             python3 -m nuitka --standalone --output-dir=build_out main.py
 
             echo "📦 4. Packing Payload..."
             cd build_out
             # 把 Nuitka 生成的文件夹打包成 payload.tar.gz
-            tar -czf payload.tar.gz main.dist
+            # 排除可能存在的缓存文件
+            tar --exclude='__pycache__' -czf payload.tar.gz main.dist
 
             echo "🛠️ 5. Creating C Launcher Source..."
-            # 编写一个微型的 C 语言启动器
-            # 这个程序会读取附加在自身末尾的压缩包数据
+            # 编写 C 语言启动器
+            # 它负责将自身的 payload 解压到 Termux 临时目录并运行
             cat > launcher.c << 'EOF'
             #include <stdio.h>
             #include <stdlib.h>
@@ -47,21 +50,26 @@ jobs:
             #include <unistd.h>
             #include <sys/stat.h>
             #include <sys/types.h>
+            #include <libgen.h>
 
             #define MARKER "PAYLOAD_START_HERE_XYZ"
             #define MARKER_LEN 22
 
             int main(int argc, char *argv[]) {
+                // 打开自身文件
                 FILE *self = fopen("/proc/self/exe", "rb");
-                if (!self) return 1;
+                if (!self) {
+                    // 如果 /proc/self/exe 失败（极少见），尝试用 argv[0]
+                    self = fopen(argv[0], "rb");
+                    if (!self) return 1;
+                }
 
                 // 1. 寻找 Payload 标记
-                // 为了简单起见，我们直接搜索标记字符串
-                // 在大文件中这可能稍慢，但对于这个用途足够快
                 unsigned char buffer[4096];
                 long payload_offset = -1;
                 size_t bytes_read;
                 
+                // 简单的搜索算法
                 while ((bytes_read = fread(buffer, 1, sizeof(buffer), self)) > 0) {
                     for (size_t i = 0; i < bytes_read - MARKER_LEN; i++) {
                         if (memcmp(buffer + i, MARKER, MARKER_LEN) == 0) {
@@ -69,7 +77,6 @@ jobs:
                             goto found;
                         }
                     }
-                    // 回退一点，防止标记跨越缓冲区边界
                     fseek(self, -MARKER_LEN, SEEK_CUR);
                 }
 
@@ -80,27 +87,30 @@ jobs:
                     return 1;
                 }
 
-                // 2. 创建临时目录
-                char tmp_dir[] = "/data/data/com.termux/files/usr/tmp/app_XXXXXX";
-                // 如果是在普通 Linux 上，回退到 /tmp
-                if (access("/data/data/com.termux/files/usr/tmp", F_OK) != 0) {
-                    strcpy(tmp_dir, "/tmp/app_XXXXXX");
+                // 2. 确定临时目录路径
+                // 优先使用 Termux 的标准缓存目录，保证权限正确
+                char tmp_dir_template[] = "/data/data/com.termux/files/usr/tmp/app_XXXXXX";
+                // 简单的 fallback 检测
+                struct stat st;
+                if (stat("/data/data/com.termux/files/usr/tmp", &st) == -1) {
+                    // 如果不是 Termux 环境，回退到 /tmp
+                    strcpy(tmp_dir_template, "/tmp/app_XXXXXX");
                 }
                 
-                if (!mkdtemp(tmp_dir)) {
+                char *tmp_path = mkdtemp(tmp_dir_template);
+                if (!tmp_path) {
                     perror("Failed to create temp dir");
                     return 1;
                 }
 
-                // 3. 提取 Payload
-                char tar_cmd[1024];
-                // 移动文件指针到 payload 开始处
+                // 3. 提取压缩包
                 fseek(self, payload_offset, SEEK_SET);
                 
-                // 将 tar.gz 写出到临时文件
-                char tar_path[512];
-                sprintf(tar_path, "%s/payload.tar.gz", tmp_dir);
+                char tar_path[1024];
+                snprintf(tar_path, sizeof(tar_path), "%s/payload.tar.gz", tmp_path);
+                
                 FILE *out_tar = fopen(tar_path, "wb");
+                if (!out_tar) return 1;
                 
                 while ((bytes_read = fread(buffer, 1, sizeof(buffer), self)) > 0) {
                     fwrite(buffer, 1, bytes_read, out_tar);
@@ -109,43 +119,45 @@ jobs:
                 fclose(self);
 
                 // 4. 解压
-                sprintf(tar_cmd, "tar -xf %s -C %s", tar_path, tmp_dir);
-                system(tar_cmd);
+                char cmd[2048];
+                snprintf(cmd, sizeof(cmd), "tar -xf \"%s\" -C \"%s\"", tar_path, tmp_path);
+                if (system(cmd) != 0) return 1;
 
-                // 5. 运行
-                // 构建启动命令，传递所有参数
-                char run_cmd[2048];
-                sprintf(run_cmd, "%s/main.dist/main.bin", tmp_dir);
+                // 5. 运行实际程序
+                // Nuitka 生成的主程序通常在 main.dist/main.bin
+                char run_path[1024];
+                snprintf(run_path, sizeof(run_path), "%s/main.dist/main.bin", tmp_path);
                 
-                // 简单的参数传递 (execv 需要数组，这里为了简化使用 system 或者是构建字符串)
-                // 为了正确处理空格，这里做简单拼接，生产环境建议用 execv
+                // 构建运行命令，传递所有参数
+                // 注意：这里为了安全使用了简单的命令拼接，生产环境可以考虑 fork+execv
+                char full_cmd[4096];
+                snprintf(full_cmd, sizeof(full_cmd), "\"%s\"", run_path);
+                
                 for (int i = 1; i < argc; i++) {
-                    strcat(run_cmd, " \"");
-                    strcat(run_cmd, argv[i]);
-                    strcat(run_cmd, "\"");
+                    strcat(full_cmd, " \"");
+                    strcat(full_cmd, argv[i]);
+                    strcat(full_cmd, "\"");
                 }
 
-                int ret = system(run_cmd);
+                int ret_code = system(full_cmd);
 
-                // 6. 清理
-                char rm_cmd[1024];
-                sprintf(rm_cmd, "rm -rf %s", tmp_dir);
-                system(rm_cmd);
+                // 6. 清理临时文件 (可选，如果你想保留缓存可以注释掉)
+                snprintf(cmd, sizeof(cmd), "rm -rf \"%s\"", tmp_path);
+                system(cmd);
 
-                return WEXITSTATUS(ret);
+                // 返回子程序的退出码
+                return WEXITSTATUS(ret_code);
             }
             EOF
 
             echo "🔨 6. Compiling Launcher..."
-            # 编译这个 C 程序，它是静态的，很小，不会导致 QEMU 崩溃
+            # 静态编译 C 启动器
             gcc -static -O2 -o final_app launcher.c
-            # 剥离符号，减小体积，增加逆向难度
             strip final_app
 
             echo "🔗 7. Attaching Payload..."
-            # 写入标记
+            # 写入标记和数据
             echo -n "PAYLOAD_START_HERE_XYZ" >> final_app
-            # 追加压缩包
             cat payload.tar.gz >> final_app
 
             echo "✅ Build finished."
@@ -155,5 +167,5 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: termux_aarch64_custom_elf
+          name: termux_aarch64_custom_elf_fixed
           path: build_out/final_app
