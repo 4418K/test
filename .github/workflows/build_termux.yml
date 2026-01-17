@@ -1,4 +1,4 @@
-name: Build for Termux (Final ELF)
+name: Build for Termux (Fixed StaticX)
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  build_android_elf:
+  build_android_final:
     runs-on: ubuntu-latest
     name: Build ELF on Alpine
     steps:
@@ -22,36 +22,40 @@ jobs:
           run: |
             echo "🔥 1. Installing System Dependencies..."
             apk update
-            # 安装 patchelf, gcc, make 等基础工具
-            apk add --no-cache python3 python3-dev py3-pip gcc musl-dev libffi-dev make build-base patchelf
+            # 安装 patchelf, gcc, make, binutils 等基础工具
+            # 注意：不使用 apk 安装 scons，避免版本冲突，统一用 pip 管理
+            apk add --no-cache python3 python3-dev py3-pip gcc musl-dev libffi-dev make build-base patchelf binutils
 
-            echo "📦 2. Installing Build Tools (Fixing StaticX Error)..."
-            # 【关键修复】显式安装 scons，这是 StaticX 编译失败的根源
+            echo "📦 2. Installing Build Dependencies..."
+            # 先单独安装 scons
             pip3 install scons --break-system-packages
 
-            echo "📦 3. Installing Nuitka and StaticX..."
-            # 现在再安装 staticx 就不会报错了
-            pip3 install nuitka staticx --break-system-packages
+            echo "📦 3. Installing StaticX (THE FIX)..."
+            # 【关键修改】加入 --no-build-isolation
+            # 这样安装 staticx 时就能找到上面安装的 scons 了
+            pip3 install staticx --no-build-isolation --break-system-packages
 
-            echo "🚀 4. Nuitka Compilation (Phase 1)..."
-            # 第一步：Nuitka 编译 Python -> C -> 独立文件夹
-            # 此时源代码已被编译为二进制 .so 文件，不再是 .py
-            # --standalone: 包含所有依赖
-            python3 -m nuitka --standalone --output-dir=build_out main.py
+            echo "📦 4. Installing Nuitka..."
+            pip3 install nuitka --break-system-packages
 
-            echo "🔮 5. StaticX Packaging (Phase 2)..."
-            # 第二步：StaticX 将文件夹打包为单个 ELF 二进制
-            # 它会自动处理 musl 库的路径问题，确保在 Termux 能跑
+            echo "🚀 5. Nuitka Compilation (Phase 1)..."
+            # 编译 Python -> C -> 独立文件夹
+            # 此时源代码已被编译为二进制 .so 文件
+            python3 -m nuitka --standalone --output-dir=build_out pppppp.py
+
+            echo "🔮 6. StaticX Packaging (Phase 2)..."
+            # 使用 StaticX 打包成单文件 ELF
+            # strip 能够减小体积并移除调试符号（增加逆向难度）
             cd build_out
-            staticx main.dist/main.bin final_app
+            staticx --strip main.dist/main.bin final_app
 
-            echo "✅ Build finished. Verifying Security..."
-            # 验证生成的是 ELF 二进制文件
-            file final_app
+            echo "✅ Build finished."
+            # 验证结果
             ls -lh final_app
+            file final_app
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: termux_aarch64_elf
+          name: termux_aarch64_elf_v2
           path: build_out/final_app
