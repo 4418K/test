@@ -32,7 +32,7 @@ jobs:
             echo "🚀 3. Nuitka Compilation..."
             # 生成 standalone 文件夹
             # 此时源代码已被编译为二进制 .so 文件，完全不可读
-            python3 -m nuitka --standalone --output-dir=build_out main.py
+            python3 -m nuitka --standalone --output-dir=build_out pppppp.py
 
             echo "📦 4. Packing Payload..."
             cd build_out
