@@ -41,7 +41,7 @@ jobs:
             # 编译命令
             # --static-libpython=no: 在 Alpine 上通常不建议强制静态链接 libpython，
             # 因为 Alpine 的动态库本身就是针对 Musl 优化的，standalone 模式会自动打包需要的库。
-            python3 -m nuitka --standalone --onefile --output-dir=build_out main.py
+            python3 -m nuitka --standalone --onefile --output-dir=build_out pppppp.py
 
             echo "✅ Build finished. Checking file info:"
             ls -lh build_out/
