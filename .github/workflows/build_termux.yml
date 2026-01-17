@@ -1,4 +1,4 @@
-name: Build for Termux (Fixed StaticX)
+name: Build for Termux (Custom ELF)
 
 on:
   push:
@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
 
 jobs:
-  build_android_final:
+  build_android_custom_elf:
     runs-on: ubuntu-latest
-    name: Build ELF on Alpine
+    name: Build ELF with C-Bootstrap
     steps:
       - uses: actions/checkout@v4
 
@@ -20,42 +20,140 @@ jobs:
           githubToken: ${{ github.token }}
           
           run: |
-            echo "🔥 1. Installing System Dependencies..."
+            echo "🔥 1. Installing dependencies..."
             apk update
-            # 安装 patchelf, gcc, make, binutils 等基础工具
-            # 注意：不使用 apk 安装 scons，避免版本冲突，统一用 pip 管理
-            apk add --no-cache python3 python3-dev py3-pip gcc musl-dev libffi-dev make build-base patchelf binutils
+            # 只需要最基础的工具：Python, GCC, Tar
+            apk add --no-cache python3 python3-dev py3-pip gcc musl-dev make build-base tar
 
-            echo "📦 2. Installing Build Dependencies..."
-            # 先单独安装 scons
-            pip3 install scons --break-system-packages
-
-            echo "📦 3. Installing StaticX (THE FIX)..."
-            # 【关键修改】加入 --no-build-isolation
-            # 这样安装 staticx 时就能找到上面安装的 scons 了
-            pip3 install staticx --no-build-isolation --break-system-packages
-
-            echo "📦 4. Installing Nuitka..."
+            echo "📦 2. Installing Nuitka..."
             pip3 install nuitka --break-system-packages
 
-            echo "🚀 5. Nuitka Compilation (Phase 1)..."
-            # 编译 Python -> C -> 独立文件夹
-            # 此时源代码已被编译为二进制 .so 文件
-            python3 -m nuitka --standalone --output-dir=build_out pppppp.py
+            echo "🚀 3. Nuitka Compilation..."
+            # 生成 standalone 文件夹
+            python3 -m nuitka --standalone --output-dir=build_out main.py
 
-            echo "🔮 6. StaticX Packaging (Phase 2)..."
-            # 使用 StaticX 打包成单文件 ELF
-            # strip 能够减小体积并移除调试符号（增加逆向难度）
+            echo "📦 4. Packing Payload..."
             cd build_out
-            staticx --strip main.dist/main.bin final_app
+            # 把 Nuitka 生成的文件夹打包成 payload.tar.gz
+            tar -czf payload.tar.gz main.dist
+
+            echo "🛠️ 5. Creating C Launcher Source..."
+            # 编写一个微型的 C 语言启动器
+            # 这个程序会读取附加在自身末尾的压缩包数据
+            cat > launcher.c << 'EOF'
+            #include <stdio.h>
+            #include <stdlib.h>
+            #include <string.h>
+            #include <unistd.h>
+            #include <sys/stat.h>
+            #include <sys/types.h>
+
+            #define MARKER "PAYLOAD_START_HERE_XYZ"
+            #define MARKER_LEN 22
+
+            int main(int argc, char *argv[]) {
+                FILE *self = fopen("/proc/self/exe", "rb");
+                if (!self) return 1;
+
+                // 1. 寻找 Payload 标记
+                // 为了简单起见，我们直接搜索标记字符串
+                // 在大文件中这可能稍慢，但对于这个用途足够快
+                unsigned char buffer[4096];
+                long payload_offset = -1;
+                size_t bytes_read;
+                
+                while ((bytes_read = fread(buffer, 1, sizeof(buffer), self)) > 0) {
+                    for (size_t i = 0; i < bytes_read - MARKER_LEN; i++) {
+                        if (memcmp(buffer + i, MARKER, MARKER_LEN) == 0) {
+                            payload_offset = ftell(self) - bytes_read + i + MARKER_LEN;
+                            goto found;
+                        }
+                    }
+                    // 回退一点，防止标记跨越缓冲区边界
+                    fseek(self, -MARKER_LEN, SEEK_CUR);
+                }
+
+            found:
+                if (payload_offset == -1) {
+                    fprintf(stderr, "Error: Corrupted binary (Payload not found).\n");
+                    fclose(self);
+                    return 1;
+                }
+
+                // 2. 创建临时目录
+                char tmp_dir[] = "/data/data/com.termux/files/usr/tmp/app_XXXXXX";
+                // 如果是在普通 Linux 上，回退到 /tmp
+                if (access("/data/data/com.termux/files/usr/tmp", F_OK) != 0) {
+                    strcpy(tmp_dir, "/tmp/app_XXXXXX");
+                }
+                
+                if (!mkdtemp(tmp_dir)) {
+                    perror("Failed to create temp dir");
+                    return 1;
+                }
+
+                // 3. 提取 Payload
+                char tar_cmd[1024];
+                // 移动文件指针到 payload 开始处
+                fseek(self, payload_offset, SEEK_SET);
+                
+                // 将 tar.gz 写出到临时文件
+                char tar_path[512];
+                sprintf(tar_path, "%s/payload.tar.gz", tmp_dir);
+                FILE *out_tar = fopen(tar_path, "wb");
+                
+                while ((bytes_read = fread(buffer, 1, sizeof(buffer), self)) > 0) {
+                    fwrite(buffer, 1, bytes_read, out_tar);
+                }
+                fclose(out_tar);
+                fclose(self);
+
+                // 4. 解压
+                sprintf(tar_cmd, "tar -xf %s -C %s", tar_path, tmp_dir);
+                system(tar_cmd);
+
+                // 5. 运行
+                // 构建启动命令，传递所有参数
+                char run_cmd[2048];
+                sprintf(run_cmd, "%s/main.dist/main.bin", tmp_dir);
+                
+                // 简单的参数传递 (execv 需要数组，这里为了简化使用 system 或者是构建字符串)
+                // 为了正确处理空格，这里做简单拼接，生产环境建议用 execv
+                for (int i = 1; i < argc; i++) {
+                    strcat(run_cmd, " \"");
+                    strcat(run_cmd, argv[i]);
+                    strcat(run_cmd, "\"");
+                }
+
+                int ret = system(run_cmd);
+
+                // 6. 清理
+                char rm_cmd[1024];
+                sprintf(rm_cmd, "rm -rf %s", tmp_dir);
+                system(rm_cmd);
+
+                return WEXITSTATUS(ret);
+            }
+            EOF
+
+            echo "🔨 6. Compiling Launcher..."
+            # 编译这个 C 程序，它是静态的，很小，不会导致 QEMU 崩溃
+            gcc -static -O2 -o final_app launcher.c
+            # 剥离符号，减小体积，增加逆向难度
+            strip final_app
+
+            echo "🔗 7. Attaching Payload..."
+            # 写入标记
+            echo -n "PAYLOAD_START_HERE_XYZ" >> final_app
+            # 追加压缩包
+            cat payload.tar.gz >> final_app
 
             echo "✅ Build finished."
-            # 验证结果
             ls -lh final_app
             file final_app
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: termux_aarch64_elf_v2
+          name: termux_aarch64_custom_elf
           path: build_out/final_app
