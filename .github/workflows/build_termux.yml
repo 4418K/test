@@ -1,96 +1,54 @@
-name: Build Termux (Android 10+ Universal)
+name: Build for Termux (Aarch64 Musl)
 
 on:
-  workflow_dispatch:
   push:
-    paths:
-      - '**.py'
+    branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
-  build-android-universal:
+  build_android_musl:
     runs-on: ubuntu-latest
-    name: Build Universal ELF for Android
-    
+    name: Build Nuitka on Alpine (aarch64)
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v3
 
-      # 1. 启用 QEMU 处理器模拟 (这是能编译出 ARM64 的关键)
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      # 2. 启用 Docker Buildx (跨平台构建引擎)
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      # 3. 动态生成 Dockerfile
-      # 我们不在 Termux 破旧的镜像里折腾，而是用 Alpine 打造一个全静态环境
-      - name: Generate Dockerfile
-        run: |
-          cat <<EOF > Dockerfile
-          # 强制使用 ARM64 架构的 Alpine 镜像
-          FROM python:3.11-alpine
-          
-          # 安装编译工具链
-          RUN apk add --no-cache build-base git patchelf scons libffi-dev zlib-dev openssl-dev
-          
-          # 更新 pip 并安装打包工具
-          RUN pip install --upgrade pip
-          RUN pip install nuitka staticx
-          
-          WORKDIR /app
-          COPY pppppp.py .
-          
-          # --- 第一步：Nuitka 编译 ---
-          # 生成独立文件夹 (Standalone)，不依赖系统 Python
-          # 不使用 --onefile 是为了兼容性，后续用 staticx 合并
-          RUN python -m nuitka \
-              --standalone \
-              --lto=no \
-              --output-dir=build \
-              pppppp.py
-          
-          # --- 调试：显示目录结构 (防止找不到文件) ---
-          RUN echo "=== 正在检查编译输出目录 ===" && ls -R build
-          
-          # --- 第二步：StaticX 打包 ---
-          # 自动寻找编译出来的二进制文件，不靠猜文件名
-          # 这会将 musl libc 和 python 库全部吸入一个文件
-          RUN \
-            TARGET=\$(find build -type f -perm +0111 ! -name "*.so" | head -n 1) && \
-            echo "Found binary at: \$TARGET" && \
-            staticx \$TARGET /app/paktool
-          
-          # --- 验证：确保是 ARM64 且为静态链接 ---
-          RUN apk add file && file /app/paktool
-          EOF
-
-      # 4. 执行构建 (关键：强制指定 linux/arm64)
-      - name: Build via Docker Buildx
-        run: |
-          echo "--- 开始构建 ARM64 镜像 ---"
-          # --platform linux/arm64 保证了生成的是手机版，不是电脑版
-          # --load 表示构建完把镜像加载回来，方便我们要提取文件
-          docker buildx build --platform linux/arm64 -t android-builder --load .
-          
-          echo "--- 从容器提取文件 ---"
-          docker create --name dummy android-builder
-          docker cp dummy:/app/paktool ./paktool
-          docker rm dummy
-          
-          echo "--- 检查文件属性 ---"
-          # 修复权限，否则无法上传
-          sudo chown $USER:$USER ./paktool
-          chmod +x ./paktool
-          
-          # 打印文件信息，你应该能看到 "ARM aarch64" 字样
-          ls -lh ./paktool
-          file ./paktool
-
-      # 5. 上传成品
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+      # 这里使用了 uraimo/run-on-arch-action
+      # 它会自动配置 QEMU 模拟器并拉取 aarch64 的镜像
+      # 我们选择 alpine，因为它是基于 MUSL 的，符合你的 zig target 要求
+      - name: Build inside Aarch64 Alpine container
+        uses: uraimo/run-on-arch-action@v2
         with:
-          name: paktool-android-arm64
-          path: paktool
-          compression-level: 0
+          arch: aarch64
+          distro: alpine_latest
+          
+          # 并不是直接把文件映射进去，而是把 workspace 挂载进去
+          githubToken: ${{ github.token }}
+          
+          # 在容器内部执行的命令
+          run: |
+            echo "🔥 Installing dependencies..."
+            apk update
+            # 安装 Python3, GCC, Musl 开发库, Ccache, Patchelf
+            apk add python3 python3-dev py3-pip gcc musl-dev libffi-dev openssl-dev make build-base ccache patchelf
+
+            echo "📦 Installing Nuitka..."
+            # 这里的 --break-system-packages 是因为 Alpine 新版 Python 的保护机制
+            pip3 install nuitka --break-system-packages
+            
+            # 如果你有第三方库，取消下面注释并安装
+            # pip3 install -r requirements.txt --break-system-packages
+
+            echo "🚀 Compiling with Nuitka..."
+            # --static-libpython: 静态链接 Python 库（关键！）
+            # --standalone: 独立运行
+            # --onefile: 单文件
+            python3 -m nuitka --standalone --onefile --static-libpython=no --output-dir=build_out main.py
+
+            echo "✅ Build finished. Checking file type..."
+            file build_out/main.bin || true
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: termux_aarch64_executable
+          path: build_out/*.bin
