@@ -1,4 +1,4 @@
-name: Build for Termux (Final Fix)
+name: Build for Termux (Footer Method)
 
 on:
   push:
@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
 
 jobs:
-  build_android_fix_env:
+  build_android_footer:
     runs-on: ubuntu-latest
-    name: Build ELF with Env Fix
+    name: Build ELF with Footer Logic
     steps:
       - uses: actions/checkout@v4
 
@@ -22,24 +22,20 @@ jobs:
           run: |
             echo "🔥 1. Installing dependencies..."
             apk update
-            apk add --no-cache python3 python3-dev py3-pip gcc musl-dev make build-base tar patchelf
+            # 必须安装 coreutils 以使用标准的 stat 命令
+            apk add --no-cache python3 python3-dev py3-pip gcc musl-dev make build-base tar patchelf coreutils
 
             echo "📦 2. Installing Nuitka..."
             pip3 install nuitka --break-system-packages
 
             echo "🚀 3. Nuitka Compilation..."
-            # 自动寻找 py 文件
             SCRIPT_NAME=$(find . -maxdepth 1 -name "*.py" | head -n 1)
             python3 -m nuitka --standalone --output-dir=build_out "$SCRIPT_NAME"
 
             echo "🔧 4. Standardizing Output Names..."
             cd build_out
-            
-            # 自动重命名文件夹
             DIST_DIR=$(find . -maxdepth 1 -type d -name "*.dist" | head -n 1)
             mv "$DIST_DIR" app_pkg
-            
-            # 自动重命名二进制
             cd app_pkg
             BIN_FILE=$(find . -maxdepth 1 -type f -name "*.bin" | head -n 1)
             mv "$BIN_FILE" entrypoint
@@ -47,8 +43,12 @@ jobs:
 
             echo "📦 5. Packing Payload..."
             tar --exclude='__pycache__' -czf payload.tar.gz app_pkg
+            
+            # 【关键步骤】计算压缩包精确大小（字节数）
+            PAYLOAD_SIZE=$(stat -c%s payload.tar.gz)
+            echo "Payload Size: $PAYLOAD_SIZE bytes"
 
-            echo "🛠️ 6. Creating C Launcher Source (WITH FIX)..."
+            echo "🛠️ 6. Creating C Launcher (Footer Logic)..."
             cat > launcher.c << 'EOF'
             #include <stdio.h>
             #include <stdlib.h>
@@ -56,84 +56,100 @@ jobs:
             #include <unistd.h>
             #include <sys/stat.h>
             #include <sys/types.h>
-            #include <libgen.h>
 
-            #define MARKER "PAYLOAD_START_HERE_XYZ"
-            #define MARKER_LEN 22
+            // Footer 结构：10位数字(大小) + 4位魔术字("TERM") = 14字节
+            // 例如：0001234567TERM
+            #define FOOTER_SIZE 14
 
             int main(int argc, char *argv[]) {
-                // 【关键修复】清除 LD_PRELOAD 环境变量
-                // Termux 的这个变量会导致静态编译的程序在调用 system() 时崩溃
-                // 或者导致架构识别错误 (EM_AARCH64 vs EM_X86_64)
+                // 1. 禁用 LD_PRELOAD 防止 Termux 崩溃
                 unsetenv("LD_PRELOAD");
 
+                // 2. 打开自身
                 FILE *self = fopen("/proc/self/exe", "rb");
                 if (!self) self = fopen(argv[0], "rb");
                 if (!self) return 1;
 
-                unsigned char buffer[4096];
-                long payload_offset = -1;
-                size_t bytes_read;
-                
-                while ((bytes_read = fread(buffer, 1, sizeof(buffer), self)) > 0) {
-                    for (size_t i = 0; i < bytes_read - MARKER_LEN; i++) {
-                        if (memcmp(buffer + i, MARKER, MARKER_LEN) == 0) {
-                            payload_offset = ftell(self) - bytes_read + i + MARKER_LEN;
-                            goto found;
-                        }
-                    }
-                    fseek(self, -MARKER_LEN, SEEK_CUR);
+                // 3. 跳到末尾读取 Footer
+                if (fseek(self, -FOOTER_SIZE, SEEK_END) != 0) {
+                    fclose(self);
+                    return 1;
                 }
 
-            found:
-                if (payload_offset == -1) return 1;
+                char footer[FOOTER_SIZE + 1];
+                if (fread(footer, 1, FOOTER_SIZE, self) != FOOTER_SIZE) {
+                    fclose(self);
+                    return 1;
+                }
+                footer[FOOTER_SIZE] = '\0';
 
-                // 确定临时目录 (使用 /data/data... 以兼容 Android 权限)
+                // 4. 验证魔术字 (最后4位是否为 TERM)
+                if (strcmp(footer + 10, "TERM") != 0) {
+                    fprintf(stderr, "Error: Invalid binary footer.\n");
+                    fclose(self);
+                    return 1;
+                }
+
+                // 5. 解析 payload 大小
+                footer[10] = '\0'; // 截断字符串，只留数字部分
+                long payload_size = atol(footer);
+                if (payload_size <= 0) {
+                    fprintf(stderr, "Error: Invalid payload size.\n");
+                    fclose(self);
+                    return 1;
+                }
+
+                // 6. 准备临时目录
                 char tmp_dir_template[] = "/data/data/com.termux/files/usr/tmp/app_XXXXXX";
                 struct stat st;
                 if (stat("/data/data/com.termux/files/usr/tmp", &st) == -1) {
                     strcpy(tmp_dir_template, "/tmp/app_XXXXXX");
                 }
-                
                 char *tmp_path = mkdtemp(tmp_dir_template);
                 if (!tmp_path) return 1;
 
-                // 提取压缩包
-                fseek(self, payload_offset, SEEK_SET);
+                // 7. 提取 Payload
+                // 定位到：文件末尾 - Footer长度 - Payload大小
+                fseek(self, -(FOOTER_SIZE + payload_size), SEEK_END);
+
                 char tar_path[1024];
                 snprintf(tar_path, sizeof(tar_path), "%s/payload.tar.gz", tmp_path);
-                
                 FILE *out_tar = fopen(tar_path, "wb");
-                while ((bytes_read = fread(buffer, 1, sizeof(buffer), self)) > 0) {
-                    fwrite(buffer, 1, bytes_read, out_tar);
+                
+                unsigned char buffer[4096];
+                long bytes_left = payload_size;
+                size_t bytes_to_read;
+
+                while (bytes_left > 0) {
+                    bytes_to_read = (bytes_left > sizeof(buffer)) ? sizeof(buffer) : bytes_left;
+                    size_t read_count = fread(buffer, 1, bytes_to_read, self);
+                    if (read_count == 0) break;
+                    fwrite(buffer, 1, read_count, out_tar);
+                    bytes_left -= read_count;
                 }
                 fclose(out_tar);
                 fclose(self);
 
-                // 解压
+                // 8. 解压并运行
                 char cmd[2048];
                 snprintf(cmd, sizeof(cmd), "tar -xf \"%s\" -C \"%s\"", tar_path, tmp_path);
-                if (system(cmd) != 0) return 1;
+                system(cmd);
 
-                // 运行
-                char run_path[1024];
-                snprintf(run_path, sizeof(run_path), "%s/app_pkg/entrypoint", tmp_path);
-                
                 char full_cmd[4096];
-                snprintf(full_cmd, sizeof(full_cmd), "\"%s\"", run_path);
+                snprintf(full_cmd, sizeof(full_cmd), "\"%s/app_pkg/entrypoint\"", tmp_path);
                 for (int i = 1; i < argc; i++) {
                     strcat(full_cmd, " \"");
                     strcat(full_cmd, argv[i]);
                     strcat(full_cmd, "\"");
                 }
+                
+                int ret = system(full_cmd);
 
-                int ret_code = system(full_cmd);
-
-                // 清理
+                // 9. 清理
                 snprintf(cmd, sizeof(cmd), "rm -rf \"%s\"", tmp_path);
                 system(cmd);
 
-                return WEXITSTATUS(ret_code);
+                return WEXITSTATUS(ret);
             }
             EOF
 
@@ -141,17 +157,21 @@ jobs:
             gcc -static -O2 -o final_app launcher.c
             strip final_app
 
-            echo "🔗 8. Attaching Payload..."
-            echo -n "PAYLOAD_START_HERE_XYZ" >> final_app
+            echo "🔗 8. Attaching Payload and Footer..."
+            # 1. 写入 ELF
+            # 2. 追加 tar.gz
             cat payload.tar.gz >> final_app
+            
+            # 3. 追加 Footer (10位大小 + 4位魔术字)
+            # %010d 保证数字长度固定为 10 位，不够补零
+            printf "%010dTERM" $PAYLOAD_SIZE >> final_app
 
             echo "✅ Build finished."
             ls -lh final_app
-            # 检查一下文件架构，确保是 ARM64
             file final_app
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: termux_aarch64_elf_fixed
+          name: termux_aarch64_elf_footer
           path: build_out/final_app
