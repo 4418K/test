@@ -1,4 +1,4 @@
-name: Build for Termux (Custom ELF Fixed)
+name: Build for Termux (Final Fix)
 
 on:
   push:
@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
 
 jobs:
-  build_android_custom_elf:
+  build_android_fix_env:
     runs-on: ubuntu-latest
-    name: Build ELF with C-Bootstrap
+    name: Build ELF with Env Fix
     steps:
       - uses: actions/checkout@v4
 
@@ -22,27 +22,33 @@ jobs:
           run: |
             echo "🔥 1. Installing dependencies..."
             apk update
-            # 【修复点】这里加上了 patchelf
-            # Nuitka standalone 模式必须要有 patchelf 才能打包 .so 文件
             apk add --no-cache python3 python3-dev py3-pip gcc musl-dev make build-base tar patchelf
 
             echo "📦 2. Installing Nuitka..."
             pip3 install nuitka --break-system-packages
 
             echo "🚀 3. Nuitka Compilation..."
-            # 生成 standalone 文件夹
-            # 此时源代码已被编译为二进制 .so 文件，完全不可读
-            python3 -m nuitka --standalone --output-dir=build_out pppppp.py
+            # 自动寻找 py 文件
+            SCRIPT_NAME=$(find . -maxdepth 1 -name "*.py" | head -n 1)
+            python3 -m nuitka --standalone --output-dir=build_out "$SCRIPT_NAME"
 
-            echo "📦 4. Packing Payload..."
+            echo "🔧 4. Standardizing Output Names..."
             cd build_out
-            # 把 Nuitka 生成的文件夹打包成 payload.tar.gz
-            # 排除可能存在的缓存文件
-            tar --exclude='__pycache__' -czf payload.tar.gz pppppp.dist
+            
+            # 自动重命名文件夹
+            DIST_DIR=$(find . -maxdepth 1 -type d -name "*.dist" | head -n 1)
+            mv "$DIST_DIR" app_pkg
+            
+            # 自动重命名二进制
+            cd app_pkg
+            BIN_FILE=$(find . -maxdepth 1 -type f -name "*.bin" | head -n 1)
+            mv "$BIN_FILE" entrypoint
+            cd ..
 
-            echo "🛠️ 5. Creating C Launcher Source..."
-            # 编写 C 语言启动器
-            # 它负责将自身的 payload 解压到 Termux 临时目录并运行
+            echo "📦 5. Packing Payload..."
+            tar --exclude='__pycache__' -czf payload.tar.gz app_pkg
+
+            echo "🛠️ 6. Creating C Launcher Source (WITH FIX)..."
             cat > launcher.c << 'EOF'
             #include <stdio.h>
             #include <stdlib.h>
@@ -56,20 +62,19 @@ jobs:
             #define MARKER_LEN 22
 
             int main(int argc, char *argv[]) {
-                // 打开自身文件
-                FILE *self = fopen("/proc/self/exe", "rb");
-                if (!self) {
-                    // 如果 /proc/self/exe 失败（极少见），尝试用 argv[0]
-                    self = fopen(argv[0], "rb");
-                    if (!self) return 1;
-                }
+                // 【关键修复】清除 LD_PRELOAD 环境变量
+                // Termux 的这个变量会导致静态编译的程序在调用 system() 时崩溃
+                // 或者导致架构识别错误 (EM_AARCH64 vs EM_X86_64)
+                unsetenv("LD_PRELOAD");
 
-                // 1. 寻找 Payload 标记
+                FILE *self = fopen("/proc/self/exe", "rb");
+                if (!self) self = fopen(argv[0], "rb");
+                if (!self) return 1;
+
                 unsigned char buffer[4096];
                 long payload_offset = -1;
                 size_t bytes_read;
                 
-                // 简单的搜索算法
                 while ((bytes_read = fread(buffer, 1, sizeof(buffer), self)) > 0) {
                     for (size_t i = 0; i < bytes_read - MARKER_LEN; i++) {
                         if (memcmp(buffer + i, MARKER, MARKER_LEN) == 0) {
@@ -81,58 +86,41 @@ jobs:
                 }
 
             found:
-                if (payload_offset == -1) {
-                    fprintf(stderr, "Error: Corrupted binary (Payload not found).\n");
-                    fclose(self);
-                    return 1;
-                }
+                if (payload_offset == -1) return 1;
 
-                // 2. 确定临时目录路径
-                // 优先使用 Termux 的标准缓存目录，保证权限正确
+                // 确定临时目录 (使用 /data/data... 以兼容 Android 权限)
                 char tmp_dir_template[] = "/data/data/com.termux/files/usr/tmp/app_XXXXXX";
-                // 简单的 fallback 检测
                 struct stat st;
                 if (stat("/data/data/com.termux/files/usr/tmp", &st) == -1) {
-                    // 如果不是 Termux 环境，回退到 /tmp
                     strcpy(tmp_dir_template, "/tmp/app_XXXXXX");
                 }
                 
                 char *tmp_path = mkdtemp(tmp_dir_template);
-                if (!tmp_path) {
-                    perror("Failed to create temp dir");
-                    return 1;
-                }
+                if (!tmp_path) return 1;
 
-                // 3. 提取压缩包
+                // 提取压缩包
                 fseek(self, payload_offset, SEEK_SET);
-                
                 char tar_path[1024];
                 snprintf(tar_path, sizeof(tar_path), "%s/payload.tar.gz", tmp_path);
                 
                 FILE *out_tar = fopen(tar_path, "wb");
-                if (!out_tar) return 1;
-                
                 while ((bytes_read = fread(buffer, 1, sizeof(buffer), self)) > 0) {
                     fwrite(buffer, 1, bytes_read, out_tar);
                 }
                 fclose(out_tar);
                 fclose(self);
 
-                // 4. 解压
+                // 解压
                 char cmd[2048];
                 snprintf(cmd, sizeof(cmd), "tar -xf \"%s\" -C \"%s\"", tar_path, tmp_path);
                 if (system(cmd) != 0) return 1;
 
-                // 5. 运行实际程序
-                // Nuitka 生成的主程序通常在 main.dist/main.bin
+                // 运行
                 char run_path[1024];
-                snprintf(run_path, sizeof(run_path), "%s/main.dist/main.bin", tmp_path);
+                snprintf(run_path, sizeof(run_path), "%s/app_pkg/entrypoint", tmp_path);
                 
-                // 构建运行命令，传递所有参数
-                // 注意：这里为了安全使用了简单的命令拼接，生产环境可以考虑 fork+execv
                 char full_cmd[4096];
                 snprintf(full_cmd, sizeof(full_cmd), "\"%s\"", run_path);
-                
                 for (int i = 1; i < argc; i++) {
                     strcat(full_cmd, " \"");
                     strcat(full_cmd, argv[i]);
@@ -141,31 +129,29 @@ jobs:
 
                 int ret_code = system(full_cmd);
 
-                // 6. 清理临时文件 (可选，如果你想保留缓存可以注释掉)
+                // 清理
                 snprintf(cmd, sizeof(cmd), "rm -rf \"%s\"", tmp_path);
                 system(cmd);
 
-                // 返回子程序的退出码
                 return WEXITSTATUS(ret_code);
             }
             EOF
 
-            echo "🔨 6. Compiling Launcher..."
-            # 静态编译 C 启动器
+            echo "🔨 7. Compiling Launcher..."
             gcc -static -O2 -o final_app launcher.c
             strip final_app
 
-            echo "🔗 7. Attaching Payload..."
-            # 写入标记和数据
+            echo "🔗 8. Attaching Payload..."
             echo -n "PAYLOAD_START_HERE_XYZ" >> final_app
             cat payload.tar.gz >> final_app
 
             echo "✅ Build finished."
             ls -lh final_app
+            # 检查一下文件架构，确保是 ARM64
             file final_app
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: termux_aarch64_custom_elf_fixed
+          name: termux_aarch64_elf_fixed
           path: build_out/final_app
