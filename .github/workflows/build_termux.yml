@@ -1,4 +1,4 @@
-name: Build for Termux (Aarch64 Musl)
+name: Build for Termux (Aarch64 Static)
 
 on:
   push:
@@ -6,51 +6,59 @@ on:
   workflow_dispatch:
 
 jobs:
-  build_android_musl:
+  build_android_static:
     runs-on: ubuntu-latest
-    name: Build Nuitka on Alpine (aarch64)
+    name: Build Static Nuitka on Alpine
     steps:
-      # 1. 更新 checkout 到 v4
       - uses: actions/checkout@v4
 
-      # 2. 使用 QEMU 模拟 Aarch64 环境运行 Alpine Linux
       - name: Build inside Aarch64 Alpine container
         uses: uraimo/run-on-arch-action@v2
         with:
           arch: aarch64
           distro: alpine_latest
-          
           githubToken: ${{ github.token }}
           
-          # 在 Alpine 容器内部运行的命令
+          # 这一步非常关键：配置全静态编译环境
           run: |
-            echo "🔥 Installing dependencies..."
-            # 更新源并安装基础编译工具
+            echo "🔥 Installing system dependencies..."
             apk update
-            # 添加 --no-cache 减小镜像体积
-            apk add --no-cache python3 python3-dev py3-pip gcc musl-dev libffi-dev openssl-dev make build-base ccache patchelf file
+            # 安装基础编译工具
+            # 关键：必须安装 zlib-static 和 openssl-libs-static，否则静态链接会报错
+            apk add --no-cache python3 python3-dev py3-pip gcc musl-dev libffi-dev make build-base ccache patchelf file zlib-static openssl-libs-static openssl-dev
 
             echo "📦 Installing Nuitka..."
-            # Alpine 的 Python 环境由系统管理，需要用 --break-system-packages
             pip3 install nuitka --break-system-packages
             
-            # 如果你有 requirements.txt，取消下面两行的注释：
+            # 如果你有依赖，取消下面注释 (注意：有些库如 numpy 很难静态编译)
             # pip3 install -r requirements.txt --break-system-packages
 
-            echo "🚀 Compiling with Nuitka..."
-            # 编译命令
-            # --static-libpython=no: 在 Alpine 上通常不建议强制静态链接 libpython，
-            # 因为 Alpine 的动态库本身就是针对 Musl 优化的，standalone 模式会自动打包需要的库。
-            python3 -m nuitka --standalone --onefile --output-dir=build_out pppppp.py
+            echo "🚀 Compiling with Nuitka (Static Mode)..."
+            
+            # 设置环境变量，强制 GCC 进行静态链接
+            # 这样 musl libc 就会被打包进 exe，而不会在运行时寻找 .so 文件
+            export LDFLAGS="-static"
+            
+            # Nuitka 命令修改：
+            # --static-libpython=yes : 把 Python 解释器静态打包
+            # --disable-ccache : 在 GitHub Actions 里有时候 ccache 会干扰静态链接，建议关闭
+            python3 -m nuitka --standalone --onefile \
+              --static-libpython=yes \
+              --disable-ccache \
+              --output-dir=build_out \
+              main.py
 
-            echo "✅ Build finished. Checking file info:"
-            ls -lh build_out/
-            file build_out/main.bin || true
+            echo "✅ Build finished. Checking binary type..."
+            # 这里的 grep 检查很重要，必须显示 "statically linked" 才算成功
+            file build_out/main.bin
+            if file build_out/main.bin | grep -q "statically linked"; then
+              echo "🎉 SUCCESS: Binary is statically linked!"
+            else
+              echo "⚠️ WARNING: Binary is still dynamically linked!"
+            fi
 
-      # 3. 修复报错的关键：升级 upload-artifact 到 v4
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: termux_aarch64_executable
+          name: termux_aarch64_static_executable
           path: build_out/*.bin
-          # v4 版本默认不压缩（或者压缩方式改变），上传速度更快
