@@ -1,4 +1,4 @@
-name: Build for Termux (StaticX)
+name: Build for Termux (Final ELF)
 
 on:
   push:
@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
 
 jobs:
-  build_android_staticx:
+  build_android_elf:
     runs-on: ubuntu-latest
-    name: Build with StaticX on Alpine
+    name: Build ELF on Alpine
     steps:
       - uses: actions/checkout@v4
 
@@ -20,36 +20,38 @@ jobs:
           githubToken: ${{ github.token }}
           
           run: |
-            echo "🔥 Installing dependencies..."
+            echo "🔥 1. Installing System Dependencies..."
             apk update
-            # 安装 StaticX 需要的构建工具：scons, gcc, musl-dev
-            apk add --no-cache python3 python3-dev py3-pip gcc musl-dev libffi-dev make build-base patchelf scons
+            # 安装 patchelf, gcc, make 等基础工具
+            apk add --no-cache python3 python3-dev py3-pip gcc musl-dev libffi-dev make build-base patchelf
 
-            echo "📦 Installing Nuitka and StaticX..."
-            # 必须安装 staticx
+            echo "📦 2. Installing Build Tools (Fixing StaticX Error)..."
+            # 【关键修复】显式安装 scons，这是 StaticX 编译失败的根源
+            pip3 install scons --break-system-packages
+
+            echo "📦 3. Installing Nuitka and StaticX..."
+            # 现在再安装 staticx 就不会报错了
             pip3 install nuitka staticx --break-system-packages
 
-            echo "🚀 1. Compiling with Nuitka (Standalone Mode)..."
-            # 注意：
-            # 1. 不要用 --onefile，改用 --standalone (生成 dist 文件夹)
-            # 2. 不要用 LDFLAGS="-static"，我们要动态链接
-            # 3. 这里的 main.py 请替换为你的真实文件名
-            python3 -m nuitka --standalone --output-dir=build_out pppppp.py
+            echo "🚀 4. Nuitka Compilation (Phase 1)..."
+            # 第一步：Nuitka 编译 Python -> C -> 独立文件夹
+            # 此时源代码已被编译为二进制 .so 文件，不再是 .py
+            # --standalone: 包含所有依赖
+            python3 -m nuitka --standalone --output-dir=build_out main.py
 
-            echo "🔮 2. Wrapping with StaticX..."
-            # StaticX 会自动寻找缺少的 musl 库并打包进去
-            # build_out/main.dist/main.bin 是 Nuitka 生成的主程序
-            # build_out/final_app 是最终生成的单文件
-            
+            echo "🔮 5. StaticX Packaging (Phase 2)..."
+            # 第二步：StaticX 将文件夹打包为单个 ELF 二进制
+            # 它会自动处理 musl 库的路径问题，确保在 Termux 能跑
             cd build_out
             staticx main.dist/main.bin final_app
 
-            echo "✅ Build finished."
-            ls -lh final_app
+            echo "✅ Build finished. Verifying Security..."
+            # 验证生成的是 ELF 二进制文件
             file final_app
+            ls -lh final_app
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: termux_aarch64_staticx
+          name: termux_aarch64_elf
           path: build_out/final_app
