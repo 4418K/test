@@ -10,45 +10,47 @@ jobs:
     runs-on: ubuntu-latest
     name: Build Nuitka on Alpine (aarch64)
     steps:
-      - uses: actions/checkout@v3
+      # 1. 更新 checkout 到 v4
+      - uses: actions/checkout@v4
 
-      # 这里使用了 uraimo/run-on-arch-action
-      # 它会自动配置 QEMU 模拟器并拉取 aarch64 的镜像
-      # 我们选择 alpine，因为它是基于 MUSL 的，符合你的 zig target 要求
+      # 2. 使用 QEMU 模拟 Aarch64 环境运行 Alpine Linux
       - name: Build inside Aarch64 Alpine container
         uses: uraimo/run-on-arch-action@v2
         with:
           arch: aarch64
           distro: alpine_latest
           
-          # 并不是直接把文件映射进去，而是把 workspace 挂载进去
           githubToken: ${{ github.token }}
           
-          # 在容器内部执行的命令
+          # 在 Alpine 容器内部运行的命令
           run: |
             echo "🔥 Installing dependencies..."
+            # 更新源并安装基础编译工具
             apk update
-            # 安装 Python3, GCC, Musl 开发库, Ccache, Patchelf
-            apk add python3 python3-dev py3-pip gcc musl-dev libffi-dev openssl-dev make build-base ccache patchelf
+            # 添加 --no-cache 减小镜像体积
+            apk add --no-cache python3 python3-dev py3-pip gcc musl-dev libffi-dev openssl-dev make build-base ccache patchelf file
 
             echo "📦 Installing Nuitka..."
-            # 这里的 --break-system-packages 是因为 Alpine 新版 Python 的保护机制
+            # Alpine 的 Python 环境由系统管理，需要用 --break-system-packages
             pip3 install nuitka --break-system-packages
             
-            # 如果你有第三方库，取消下面注释并安装
+            # 如果你有 requirements.txt，取消下面两行的注释：
             # pip3 install -r requirements.txt --break-system-packages
 
             echo "🚀 Compiling with Nuitka..."
-            # --static-libpython: 静态链接 Python 库（关键！）
-            # --standalone: 独立运行
-            # --onefile: 单文件
-            python3 -m nuitka --standalone --onefile --static-libpython=no --output-dir=build_out main.py
+            # 编译命令
+            # --static-libpython=no: 在 Alpine 上通常不建议强制静态链接 libpython，
+            # 因为 Alpine 的动态库本身就是针对 Musl 优化的，standalone 模式会自动打包需要的库。
+            python3 -m nuitka --standalone --onefile --output-dir=build_out main.py
 
-            echo "✅ Build finished. Checking file type..."
+            echo "✅ Build finished. Checking file info:"
+            ls -lh build_out/
             file build_out/main.bin || true
 
+      # 3. 修复报错的关键：升级 upload-artifact 到 v4
       - name: Upload Artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: termux_aarch64_executable
           path: build_out/*.bin
+          # v4 版本默认不压缩（或者压缩方式改变），上传速度更快
