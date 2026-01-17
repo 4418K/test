@@ -46,7 +46,7 @@ jobs:
               --static-libpython=yes \
               --disable-ccache \
               --output-dir=build_out \
-              main.py
+              pppppp.py
 
             echo "✅ Build finished. Checking binary type..."
             # 这里的 grep 检查很重要，必须显示 "statically linked" 才算成功
