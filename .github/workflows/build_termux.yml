@@ -1,4 +1,4 @@
-name: Build in Termux Environment
+name: Build for Termux (Native Docker)
 
 on:
   push:
@@ -6,73 +6,178 @@ on:
   workflow_dispatch:
 
 jobs:
-  build_termux_native:
+  build_native_termux:
     runs-on: ubuntu-latest
-    name: Build using Termux Docker
+    name: Build inside Termux Container
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build in Termux Container
+      # 1. 启用 QEMU，让 GitHub Actions 能运行 ARM64 容器
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      # 2. 在 Termux 官方镜像中进行编译
+      # 这一步是关键！我们在真正的 Termux 环境里干活，生成的绝对是亲生的
+      - name: Build in Termux Docker
         run: |
-          # 1. 拉取 Termux 官方 Docker 镜像
-          # 这个镜像内部是真正的 Termux 环境 (Bionic libc)
-          docker pull ghcr.io/termux/termux-docker:latest
-
-          # 2. 创建构建脚本
-          cat > build_inside.sh << 'EOF'
-          #!/data/data/com.termux/files/usr/bin/bash
+          # 创建构建脚本，这将在容器内部运行
+          cat > build_script.sh << 'EOF'
           set -e
+          
+          echo "🔥 [1/6] Setting up Termux environment..."
+          # 切换 Termux 源 (防止官方源慢)
+          termux-change-repo
+          pkg update -y
+          
+          # 安装必要的工具
+          # python: 运行 nuitka
+          # clang: 编译 C 启动器
+          # binutils: 包含 strip 等工具
+          # patchelf: nuitka 需要
+          pkg install -y python clang binutils patchelf make tar
 
-          echo "🔧 Setting up Termux environment..."
-          # 更新包
-          apt update
-          apt upgrade -y
-
-          # 安装编译工具
-          apt install -y python clang binutils patchelf make
-
-          echo "📦 Installing Nuitka..."
+          echo "📦 [2/6] Installing Nuitka..."
           pip install nuitka
 
-          echo "🚀 Compiling..."
-          cd /work
-          # 找到 py 文件
-          SCRIPT=$(ls *.py | head -n 1)
-          echo "Found script: $SCRIPT"
+          echo "🚀 [3/6] Compiling Python to C-Extension..."
+          cd /workspace
+          # 自动寻找 py 文件
+          SCRIPT_NAME=$(ls *.py | head -n 1)
+          echo "Processing: $SCRIPT_NAME"
+          
+          # 编译为 standalone 文件夹
+          # 注意：这里生成的 .so 文件是原生 Bionic 格式的
+          python -m nuitka --standalone --output-dir=build_out "$SCRIPT_NAME"
 
-          # 编译 (standalone 模式)
-          python -m nuitka --standalone --output-dir=build_out "$SCRIPT"
-
-          # 整理输出
+          echo "🔧 [4/6] Preparing Payload..."
           cd build_out
+          # 重命名 dist 目录
           DIST_DIR=$(ls -d *.dist | head -n 1)
           mv "$DIST_DIR" app_pkg
           
+          # 重命名入口二进制
           cd app_pkg
-          BIN_FILE=$(ls *.bin 2>/dev/null | head -n 1)
-          if [ -n "$BIN_FILE" ]; then
-            mv "$BIN_FILE" final_app
-          fi
+          BIN_FILE=$(ls *.bin | head -n 1)
+          mv "$BIN_FILE" entrypoint
+          cd ..
+          
+          # 打包
+          tar -czf payload.tar.gz app_pkg
+          PAYLOAD_SIZE=$(stat -c%s payload.tar.gz)
+          echo "Payload size: $PAYLOAD_SIZE"
 
-          echo "✅ Build complete!"
-          ls -la
+          echo "🛠️ [5/6] Compiling Native C Launcher..."
+          cat > launcher.c << 'C_CODE'
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <unistd.h>
+          #include <sys/stat.h>
+          #include <sys/types.h>
+
+          #define FOOTER_SIZE 14
+
+          int main(int argc, char *argv[]) {
+              // 1. Android 特有的环境变量清理
+              unsetenv("LD_PRELOAD");
+
+              // 2. 自身定位
+              FILE *self = fopen("/proc/self/exe", "rb");
+              if (!self) self = fopen(argv[0], "rb");
+              if (!self) return 1;
+
+              // 3. 读取 Footer
+              if (fseek(self, -FOOTER_SIZE, SEEK_END) != 0) return 1;
+              char footer[FOOTER_SIZE + 1];
+              if (fread(footer, 1, FOOTER_SIZE, self) != FOOTER_SIZE) return 1;
+              if (strncmp(footer + 10, "TERM", 4) != 0) return 1;
+              
+              footer[10] = '\0';
+              long payload_size = atol(footer);
+
+              // 4. 创建临时目录
+              char tmp_dir_template[] = "/data/data/com.termux/files/usr/tmp/app_XXXXXX";
+              // 如果不在 Termux 标准路径，尝试 /tmp (容错)
+              struct stat st;
+              if (stat("/data/data/com.termux/files/usr/tmp", &st) == -1) {
+                  strcpy(tmp_dir_template, "/tmp/app_XXXXXX");
+              }
+              char *tmp_path = mkdtemp(tmp_dir_template);
+              if (!tmp_path) return 1;
+
+              // 5. 提取 Payload
+              fseek(self, -(FOOTER_SIZE + payload_size), SEEK_END);
+              char tar_path[1024];
+              snprintf(tar_path, sizeof(tar_path), "%s/payload.tar.gz", tmp_path);
+              FILE *out_tar = fopen(tar_path, "wb");
+              
+              unsigned char buffer[8192];
+              long bytes_left = payload_size;
+              while (bytes_left > 0) {
+                  size_t to_read = (bytes_left > sizeof(buffer)) ? sizeof(buffer) : bytes_left;
+                  size_t read = fread(buffer, 1, to_read, self);
+                  if (read == 0) break;
+                  fwrite(buffer, 1, read, out_tar);
+                  bytes_left -= read;
+              }
+              fclose(out_tar);
+              fclose(self);
+
+              // 6. 解压 (使用 -m 忽略时间戳)
+              char cmd[2048];
+              snprintf(cmd, sizeof(cmd), "tar -xf \"%s\" -C \"%s\" -m", tar_path, tmp_path);
+              system(cmd);
+
+              // 7. 运行
+              // 关键：显式设置 LD_LIBRARY_PATH，因为 Android 忽略 RPATH
+              // 我们指向解压后的 app_pkg 目录，那里有 libpython 和其他 .so
+              char run_cmd[4096];
+              snprintf(run_cmd, sizeof(run_cmd), 
+                  "export LD_LIBRARY_PATH=\"%s/app_pkg:$LD_LIBRARY_PATH\"; "
+                  "\"%s/app_pkg/entrypoint\" ", 
+                  tmp_path, tmp_path);
+              
+              for (int i = 1; i < argc; i++) {
+                  strcat(run_cmd, " \"");
+                  strcat(run_cmd, argv[i]);
+                  strcat(run_cmd, "\"");
+              }
+              
+              int ret = system(run_cmd);
+
+              // 8. 清理
+              snprintf(cmd, sizeof(cmd), "rm -rf \"%s\"", tmp_path);
+              system(cmd);
+
+              return WEXITSTATUS(ret);
+          }
+          C_CODE
+
+          # 使用 Termux 的 Clang 编译
+          # 这样生成的 final_app 就是原生的 Android ELF 文件！
+          clang -O2 -o final_app launcher.c
+          strip final_app
+
+          echo "🔗 [6/6] Attaching Payload..."
+          cat payload.tar.gz >> final_app
+          printf "%010dTERM" $PAYLOAD_SIZE >> final_app
+          
+          mv final_app /workspace/final_app_native
+          echo "✅ Success!"
           EOF
 
-          chmod +x build_inside.sh
+          chmod +x build_script.sh
 
-          # 3. 在 Termux 容器中运行构建
+          # 启动 Termux 容器并运行上面的脚本
+          # 使用 termux/termux-docker:aarch64 镜像
           docker run --rm \
-            -v "$PWD:/work" \
-            -v "$PWD/build_inside.sh:/build_inside.sh" \
-            ghcr.io/termux/termux-docker:latest \
-            /data/data/com.termux/files/usr/bin/bash /build_inside.sh
-
-          # 4. 打包结果
-          cd build_out/app_pkg
-          tar -czf ../../termux_app.tar.gz .
+            --platform linux/arm64 \
+            -v "$PWD:/workspace" \
+            termux/termux-docker:aarch64 \
+            /bin/bash /workspace/build_script.sh
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: termux_native_build
-          path: termux_app.tar.gz
+          name: termux_native_elf
+          path: final_app_native
