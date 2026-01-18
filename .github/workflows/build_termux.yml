@@ -1,4 +1,4 @@
-name: Build for Termux (Final V3)
+name: Build for Termux (Final V4 - Loader Fix)
 
 on:
   push:
@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
 
 jobs:
-  build_android_final_v3:
+  build_android_loader_fix:
     runs-on: ubuntu-latest
-    name: Build ELF with LD_LIBRARY_PATH Fix
+    name: Build ELF with Bundled Loader
     steps:
       - uses: actions/checkout@v4
 
@@ -29,27 +29,30 @@ jobs:
 
             echo "🚀 3. Nuitka Compilation..."
             SCRIPT_NAME=$(find . -maxdepth 1 -name "*.py" | head -n 1)
-            # --standalone: 打包所有依赖库
             python3 -m nuitka --standalone --output-dir=build_out "$SCRIPT_NAME"
 
-            echo "🔧 4. Standardizing Output Names..."
+            echo "🔧 4. Packaging & Bundling Loader..."
             cd build_out
             DIST_DIR=$(find . -maxdepth 1 -type d -name "*.dist" | head -n 1)
             mv "$DIST_DIR" app_pkg
+            
             cd app_pkg
             BIN_FILE=$(find . -maxdepth 1 -type f -name "*.bin" | head -n 1)
             mv "$BIN_FILE" entrypoint
+            
+            # 【关键步骤 1】把 Alpine 系统的动态加载器(ld-musl) 偷出来，打包进程序
+            # 这样我们在 Android 上就能用它来解释运行 musl 的程序了
+            cp /lib/libc.musl-aarch64.so.1 ./ld-musl.so
+            chmod +x ./ld-musl.so
+            echo "Bundled ld-musl.so successfully."
             cd ..
 
             echo "📦 5. Packing Payload..."
-            # 使用 tar 打包
             tar --exclude='__pycache__' -czf payload.tar.gz app_pkg
-            
-            # 计算大小用于 Footer 定位
             PAYLOAD_SIZE=$(stat -c%s payload.tar.gz)
             echo "Payload Size: $PAYLOAD_SIZE bytes"
 
-            echo "🛠️ 6. Creating C Launcher (With Env Fix)..."
+            echo "🛠️ 6. Creating C Launcher (Loader Strategy)..."
             cat > launcher.c << 'EOF'
             #include <stdio.h>
             #include <stdlib.h>
@@ -61,15 +64,16 @@ jobs:
             #define FOOTER_SIZE 14
 
             int main(int argc, char *argv[]) {
-                // 1. 清除 Termux 的 Hook，防止 system() 崩溃
+                // 1. 清除 LD_PRELOAD (防止 Termux Hook 干扰)
                 unsetenv("LD_PRELOAD");
+                
+                // 2. 注意：绝对不要在这里全局设置 LD_LIBRARY_PATH
+                // 否则会导致后面的 rm, tar 等系统命令崩溃
 
-                // 2. 打开自身
                 FILE *self = fopen("/proc/self/exe", "rb");
                 if (!self) self = fopen(argv[0], "rb");
                 if (!self) return 1;
 
-                // 3. 读取 Footer 获取 Payload 大小
                 if (fseek(self, -FOOTER_SIZE, SEEK_END) != 0) { fclose(self); return 1; }
                 char footer[FOOTER_SIZE + 1];
                 if (fread(footer, 1, FOOTER_SIZE, self) != FOOTER_SIZE) { fclose(self); return 1; }
@@ -78,7 +82,6 @@ jobs:
                 footer[10] = '\0';
                 long payload_size = atol(footer);
                 
-                // 4. 创建临时目录
                 char tmp_dir_template[] = "/data/data/com.termux/files/usr/tmp/app_XXXXXX";
                 struct stat st;
                 if (stat("/data/data/com.termux/files/usr/tmp", &st) == -1) {
@@ -87,7 +90,6 @@ jobs:
                 char *tmp_path = mkdtemp(tmp_dir_template);
                 if (!tmp_path) return 1;
 
-                // 5. 提取 Payload
                 fseek(self, -(FOOTER_SIZE + payload_size), SEEK_END);
                 char tar_path[1024];
                 snprintf(tar_path, sizeof(tar_path), "%s/payload.tar.gz", tmp_path);
@@ -105,44 +107,35 @@ jobs:
                 fclose(out_tar);
                 fclose(self);
 
-                // 6. 解压
-                // 增加 -m 参数：忽略时间戳，防止 tar 报错 "future time stamp"
+                // 解压 (加上 -m 忽略时间戳)
                 char cmd[2048];
                 snprintf(cmd, sizeof(cmd), "tar -xf \"%s\" -C \"%s\" -m", tar_path, tmp_path);
                 system(cmd);
 
-                // 7. 【关键修复】设置 LD_LIBRARY_PATH
-                // Android 忽略 RPATH，所以必须显式告诉 Linker 去哪里找 libpython.so
-                // 我们把临时目录下的 app_pkg 文件夹加入环境变量
-                char lib_path[1024];
-                snprintf(lib_path, sizeof(lib_path), "%s/app_pkg", tmp_path);
+                // 【关键步骤 2】构建启动命令
+                // 格式：LD_LIBRARY_PATH=...  ./ld-musl.so  ./entrypoint  args...
+                // 我们显式调用打包进去的 ld-musl.so 来运行程序，绕过 Android 系统加载器
                 
-                char *old_ld = getenv("LD_LIBRARY_PATH");
-                char new_ld[4096];
-                if (old_ld) {
-                    snprintf(new_ld, sizeof(new_ld), "%s:%s", lib_path, old_ld);
-                } else {
-                    snprintf(new_ld, sizeof(new_ld), "%s", lib_path);
-                }
-                // 覆盖环境变量，仅对当前进程和子进程有效
-                setenv("LD_LIBRARY_PATH", new_ld, 1);
-
-                // 8. 运行
-                // 此时 LD_LIBRARY_PATH 已经包含了 .so 的路径
-                char run_path[1024];
-                snprintf(run_path, sizeof(run_path), "%s/app_pkg/entrypoint", tmp_path);
+                char run_cmd[8192];
+                // 拼接 LD_LIBRARY_PATH 环境变量 (只对这行命令有效)
+                // 必须包含 app_pkg 目录，这样才能找到 libpython 等依赖
+                snprintf(run_cmd, sizeof(run_cmd), 
+                    "LD_LIBRARY_PATH=\"%s/app_pkg:$LD_LIBRARY_PATH\" "
+                    "\"%s/app_pkg/ld-musl.so\" "
+                    "\"%s/app_pkg/entrypoint\"", 
+                    tmp_path, tmp_path, tmp_path);
                 
-                char full_cmd[4096];
-                snprintf(full_cmd, sizeof(full_cmd), "\"%s\"", run_path);
+                // 拼接参数
                 for (int i = 1; i < argc; i++) {
-                    strcat(full_cmd, " \"");
-                    strcat(full_cmd, argv[i]);
-                    strcat(full_cmd, "\"");
+                    strcat(run_cmd, " \"");
+                    strcat(run_cmd, argv[i]);
+                    strcat(run_cmd, "\"");
                 }
                 
-                int ret = system(full_cmd);
+                // 执行
+                int ret = system(run_cmd);
 
-                // 9. 清理
+                // 清理
                 snprintf(cmd, sizeof(cmd), "rm -rf \"%s\"", tmp_path);
                 system(cmd);
 
@@ -154,7 +147,7 @@ jobs:
             gcc -static -O2 -o final_app launcher.c
             strip final_app
 
-            echo "🔗 8. Attaching Data..."
+            echo "🔗 8. Attaching Payload..."
             cat payload.tar.gz >> final_app
             printf "%010dTERM" $PAYLOAD_SIZE >> final_app
 
@@ -165,5 +158,5 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: termux_aarch64_elf_final_v3
+          name: termux_aarch64_elf_final_v4
           path: build_out/final_app
