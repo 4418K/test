@@ -1,4 +1,4 @@
-name: Build for Termux (Final V4 - Loader Fix)
+name: Build for Termux (Hybrid NDK)
 
 on:
   push:
@@ -6,32 +6,32 @@ on:
   workflow_dispatch:
 
 jobs:
-  build_android_loader_fix:
+  build_hybrid:
     runs-on: ubuntu-latest
-    name: Build ELF with Bundled Loader
+    name: Hybrid Build (Musl Payload + Bionic Launcher)
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build inside Aarch64 Alpine container
+      # ----------------------------------------------------------------
+      # 第一步：在 Alpine 容器里构建 Python Payload (Musl 格式)
+      # ----------------------------------------------------------------
+      - name: Build Payload in Alpine
         uses: uraimo/run-on-arch-action@v2
         with:
           arch: aarch64
           distro: alpine_latest
           githubToken: ${{ github.token }}
-          
           run: |
-            echo "🔥 1. Installing dependencies..."
             apk update
             apk add --no-cache python3 python3-dev py3-pip gcc musl-dev make build-base tar patchelf coreutils
 
-            echo "📦 2. Installing Nuitka..."
             pip3 install nuitka --break-system-packages
 
-            echo "🚀 3. Nuitka Compilation..."
+            # 1. Nuitka 编译
             SCRIPT_NAME=$(find . -maxdepth 1 -name "*.py" | head -n 1)
             python3 -m nuitka --standalone --output-dir=build_out "$SCRIPT_NAME"
 
-            echo "🔧 4. Packaging & Bundling Loader..."
+            # 2. 整理目录
             cd build_out
             DIST_DIR=$(find . -maxdepth 1 -type d -name "*.dist" | head -n 1)
             mv "$DIST_DIR" app_pkg
@@ -40,123 +40,153 @@ jobs:
             BIN_FILE=$(find . -maxdepth 1 -type f -name "*.bin" | head -n 1)
             mv "$BIN_FILE" entrypoint
             
-            # 【关键步骤 1】把 Alpine 系统的动态加载器(ld-musl) 偷出来，打包进程序
-            # 这样我们在 Android 上就能用它来解释运行 musl 的程序了
+            # 3. 偷取 ld-musl.so (关键！)
             cp /lib/libc.musl-aarch64.so.1 ./ld-musl.so
             chmod +x ./ld-musl.so
-            echo "Bundled ld-musl.so successfully."
+            
+            # 4. 创建一个 run.sh 脚本，负责复杂的启动逻辑
+            # 这样 C 语言只需要 system("sh run.sh") 即可，避免环境问题
+            cat > run.sh << 'EOF'
+            #!/bin/sh
+            DIR=$(dirname "$0")
+            # 显式使用 bundled loader 运行程序
+            # 同时也设置 LD_LIBRARY_PATH 给 python 用
+            export LD_LIBRARY_PATH="$DIR:$LD_LIBRARY_PATH"
+            exec "$DIR/ld-musl.so" "$DIR/entrypoint" "$@"
+            EOF
+            chmod +x run.sh
             cd ..
 
-            echo "📦 5. Packing Payload..."
+            # 5. 打包 Payload
             tar --exclude='__pycache__' -czf payload.tar.gz app_pkg
-            PAYLOAD_SIZE=$(stat -c%s payload.tar.gz)
-            echo "Payload Size: $PAYLOAD_SIZE bytes"
 
-            echo "🛠️ 6. Creating C Launcher (Loader Strategy)..."
-            cat > launcher.c << 'EOF'
-            #include <stdio.h>
-            #include <stdlib.h>
-            #include <string.h>
-            #include <unistd.h>
-            #include <sys/stat.h>
-            #include <sys/types.h>
+      # ----------------------------------------------------------------
+      # 第二步：在 Ubuntu 主机上使用 NDK 编译启动器 (Bionic 格式)
+      # ----------------------------------------------------------------
+      - name: Compile Launcher with Android NDK
+        run: |
+          # 1. 获取 payload 大小
+          PAYLOAD_SIZE=$(stat -c%s build_out/payload.tar.gz)
+          echo "Payload Size: $PAYLOAD_SIZE"
 
-            #define FOOTER_SIZE 14
+          # 2. 编写 C 启动器源码
+          cat > launcher.c << EOF
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <unistd.h>
+          #include <sys/stat.h>
+          #include <sys/types.h>
 
-            int main(int argc, char *argv[]) {
-                // 1. 清除 LD_PRELOAD (防止 Termux Hook 干扰)
-                unsetenv("LD_PRELOAD");
-                
-                // 2. 注意：绝对不要在这里全局设置 LD_LIBRARY_PATH
-                // 否则会导致后面的 rm, tar 等系统命令崩溃
+          #define FOOTER_SIZE 14
+          // 这里的 PAYLOAD_SIZE 只是占位逻辑，实际通过读取文件末尾获取
 
-                FILE *self = fopen("/proc/self/exe", "rb");
-                if (!self) self = fopen(argv[0], "rb");
-                if (!self) return 1;
+          int main(int argc, char *argv[]) {
+              // 清除干扰变量
+              unsetenv("LD_PRELOAD");
 
-                if (fseek(self, -FOOTER_SIZE, SEEK_END) != 0) { fclose(self); return 1; }
-                char footer[FOOTER_SIZE + 1];
-                if (fread(footer, 1, FOOTER_SIZE, self) != FOOTER_SIZE) { fclose(self); return 1; }
-                if (strncmp(footer + 10, "TERM", 4) != 0) { fclose(self); return 1; }
-                
-                footer[10] = '\0';
-                long payload_size = atol(footer);
-                
-                char tmp_dir_template[] = "/data/data/com.termux/files/usr/tmp/app_XXXXXX";
-                struct stat st;
-                if (stat("/data/data/com.termux/files/usr/tmp", &st) == -1) {
-                    strcpy(tmp_dir_template, "/tmp/app_XXXXXX");
-                }
-                char *tmp_path = mkdtemp(tmp_dir_template);
-                if (!tmp_path) return 1;
+              FILE *self = fopen("/proc/self/exe", "rb");
+              if (!self) self = fopen(argv[0], "rb");
+              if (!self) return 1;
 
-                fseek(self, -(FOOTER_SIZE + payload_size), SEEK_END);
-                char tar_path[1024];
-                snprintf(tar_path, sizeof(tar_path), "%s/payload.tar.gz", tmp_path);
-                FILE *out_tar = fopen(tar_path, "wb");
-                
-                unsigned char buffer[8192];
-                long bytes_left = payload_size;
-                while (bytes_left > 0) {
-                    size_t to_read = (bytes_left > sizeof(buffer)) ? sizeof(buffer) : bytes_left;
-                    size_t read = fread(buffer, 1, to_read, self);
-                    if (read == 0) break;
-                    fwrite(buffer, 1, read, out_tar);
-                    bytes_left -= read;
-                }
-                fclose(out_tar);
-                fclose(self);
+              // 读取 Footer
+              if (fseek(self, -FOOTER_SIZE, SEEK_END) != 0) return 1;
+              char footer[FOOTER_SIZE + 1];
+              if (fread(footer, 1, FOOTER_SIZE, self) != FOOTER_SIZE) return 1;
+              if (strncmp(footer + 10, "TERM", 4) != 0) return 1;
+              
+              footer[10] = '\0';
+              long payload_size = atol(footer);
 
-                // 解压 (加上 -m 忽略时间戳)
-                char cmd[2048];
-                snprintf(cmd, sizeof(cmd), "tar -xf \"%s\" -C \"%s\" -m", tar_path, tmp_path);
-                system(cmd);
+              // 创建临时目录
+              char tmp_dir_template[] = "/data/data/com.termux/files/usr/tmp/app_XXXXXX";
+              struct stat st;
+              if (stat("/data/data/com.termux/files/usr/tmp", &st) == -1) {
+                  strcpy(tmp_dir_template, "/tmp/app_XXXXXX");
+              }
+              char *tmp_path = mkdtemp(tmp_dir_template);
+              if (!tmp_path) return 1;
 
-                // 【关键步骤 2】构建启动命令
-                // 格式：LD_LIBRARY_PATH=...  ./ld-musl.so  ./entrypoint  args...
-                // 我们显式调用打包进去的 ld-musl.so 来运行程序，绕过 Android 系统加载器
-                
-                char run_cmd[8192];
-                // 拼接 LD_LIBRARY_PATH 环境变量 (只对这行命令有效)
-                // 必须包含 app_pkg 目录，这样才能找到 libpython 等依赖
-                snprintf(run_cmd, sizeof(run_cmd), 
-                    "LD_LIBRARY_PATH=\"%s/app_pkg:$LD_LIBRARY_PATH\" "
-                    "\"%s/app_pkg/ld-musl.so\" "
-                    "\"%s/app_pkg/entrypoint\"", 
-                    tmp_path, tmp_path, tmp_path);
-                
-                // 拼接参数
-                for (int i = 1; i < argc; i++) {
-                    strcat(run_cmd, " \"");
-                    strcat(run_cmd, argv[i]);
-                    strcat(run_cmd, "\"");
-                }
-                
-                // 执行
-                int ret = system(run_cmd);
+              // 提取 Payload
+              fseek(self, -(FOOTER_SIZE + payload_size), SEEK_END);
+              char tar_path[1024];
+              snprintf(tar_path, sizeof(tar_path), "%s/payload.tar.gz", tmp_path);
+              FILE *out_tar = fopen(tar_path, "wb");
+              
+              unsigned char buffer[8192];
+              long bytes_left = payload_size;
+              while (bytes_left > 0) {
+                  size_t to_read = (bytes_left > sizeof(buffer)) ? sizeof(buffer) : bytes_left;
+                  size_t read = fread(buffer, 1, to_read, self);
+                  if (read == 0) break;
+                  fwrite(buffer, 1, read, out_tar);
+                  bytes_left -= read;
+              }
+              fclose(out_tar);
+              fclose(self);
 
-                // 清理
-                snprintf(cmd, sizeof(cmd), "rm -rf \"%s\"", tmp_path);
-                system(cmd);
+              // 解压
+              char cmd[2048];
+              snprintf(cmd, sizeof(cmd), "tar -xf \"%s\" -C \"%s\" -m", tar_path, tmp_path);
+              system(cmd);
 
-                return WEXITSTATUS(ret);
-            }
-            EOF
+              // 运行内部脚本 (移交控制权)
+              char run_cmd[4096];
+              snprintf(run_cmd, sizeof(run_cmd), "\"%s/app_pkg/run.sh\"", tmp_path);
+              
+              // 传递参数
+              for (int i = 1; i < argc; i++) {
+                  strcat(run_cmd, " \"");
+                  strcat(run_cmd, argv[i]);
+                  strcat(run_cmd, "\"");
+              }
+              
+              int ret = system(run_cmd);
 
-            echo "🔨 7. Compiling Launcher..."
-            gcc -static -O2 -o final_app launcher.c
-            strip final_app
+              // 清理
+              snprintf(cmd, sizeof(cmd), "rm -rf \"%s\"", tmp_path);
+              system(cmd);
 
-            echo "🔗 8. Attaching Payload..."
-            cat payload.tar.gz >> final_app
-            printf "%010dTERM" $PAYLOAD_SIZE >> final_app
+              return WEXITSTATUS(ret);
+          }
+          EOF
 
-            echo "✅ Build finished."
-            ls -lh final_app
-            file final_app
+          # 3. 使用 Android NDK 交叉编译 (关键步骤！)
+          # GitHub Actions 的 ubuntu-latest 预装了 NDK，位于 $ANDROID_NDK_HOME
+          # 如果没有环境变量，尝试常见路径
+          if [ -z "$ANDROID_NDK_HOME" ]; then
+            export ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk-bundle
+          fi
+          
+          # 寻找 clang 编译器
+          NDK_TOOLCHAIN=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
+          # 目标: Android API 24 (Android 7.0+), Aarch64
+          CC=$NDK_TOOLCHAIN/aarch64-linux-android24-clang
+          
+          echo "Compiling using NDK: $CC"
+          
+          # 编译！
+          $CC -o final_app launcher.c -O2
+
+      # ----------------------------------------------------------------
+      # 第三步：合体
+      # ----------------------------------------------------------------
+      - name: Combine and Upload
+        run: |
+          # 1. 读取 payload 大小
+          PAYLOAD_SIZE=$(stat -c%s build_out/payload.tar.gz)
+          
+          # 2. 合并
+          cat build_out/payload.tar.gz >> final_app
+          
+          # 3. 写入 Footer (10位大小 + TERM)
+          printf "%010dTERM" $PAYLOAD_SIZE >> final_app
+          
+          ls -lh final_app
+          file final_app
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: termux_aarch64_elf_final_v4
-          path: build_out/final_app
+          name: termux_aarch64_hybrid_final
+          path: final_app
