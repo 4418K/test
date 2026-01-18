@@ -1,4 +1,4 @@
-name: Build for Termux (Hybrid NDK)
+name: Build in Termux Environment
 
 on:
   push:
@@ -6,187 +6,73 @@ on:
   workflow_dispatch:
 
 jobs:
-  build_hybrid:
+  build_termux_native:
     runs-on: ubuntu-latest
-    name: Hybrid Build (Musl Payload + Bionic Launcher)
+    name: Build using Termux Docker
     steps:
       - uses: actions/checkout@v4
 
-      # ----------------------------------------------------------------
-      # 第一步：在 Alpine 容器里构建 Python Payload (Musl 格式)
-      # ----------------------------------------------------------------
-      - name: Build Payload in Alpine
-        uses: uraimo/run-on-arch-action@v2
-        with:
-          arch: aarch64
-          distro: alpine_latest
-          githubToken: ${{ github.token }}
-          run: |
-            apk update
-            apk add --no-cache python3 python3-dev py3-pip gcc musl-dev make build-base tar patchelf coreutils
-
-            pip3 install nuitka --break-system-packages
-
-            # 1. Nuitka 编译
-            SCRIPT_NAME=$(find . -maxdepth 1 -name "*.py" | head -n 1)
-            python3 -m nuitka --standalone --output-dir=build_out "$SCRIPT_NAME"
-
-            # 2. 整理目录
-            cd build_out
-            DIST_DIR=$(find . -maxdepth 1 -type d -name "*.dist" | head -n 1)
-            mv "$DIST_DIR" app_pkg
-            
-            cd app_pkg
-            BIN_FILE=$(find . -maxdepth 1 -type f -name "*.bin" | head -n 1)
-            mv "$BIN_FILE" entrypoint
-            
-            # 3. 偷取 ld-musl.so (关键！)
-            cp /lib/libc.musl-aarch64.so.1 ./ld-musl.so
-            chmod +x ./ld-musl.so
-            
-            # 4. 创建一个 run.sh 脚本，负责复杂的启动逻辑
-            # 这样 C 语言只需要 system("sh run.sh") 即可，避免环境问题
-            cat > run.sh << 'EOF'
-            #!/bin/sh
-            DIR=$(dirname "$0")
-            # 显式使用 bundled loader 运行程序
-            # 同时也设置 LD_LIBRARY_PATH 给 python 用
-            export LD_LIBRARY_PATH="$DIR:$LD_LIBRARY_PATH"
-            exec "$DIR/ld-musl.so" "$DIR/entrypoint" "$@"
-            EOF
-            chmod +x run.sh
-            cd ..
-
-            # 5. 打包 Payload
-            tar --exclude='__pycache__' -czf payload.tar.gz app_pkg
-
-      # ----------------------------------------------------------------
-      # 第二步：在 Ubuntu 主机上使用 NDK 编译启动器 (Bionic 格式)
-      # ----------------------------------------------------------------
-      - name: Compile Launcher with Android NDK
+      - name: Build in Termux Container
         run: |
-          # 1. 获取 payload 大小
-          PAYLOAD_SIZE=$(stat -c%s build_out/payload.tar.gz)
-          echo "Payload Size: $PAYLOAD_SIZE"
+          # 1. 拉取 Termux 官方 Docker 镜像
+          # 这个镜像内部是真正的 Termux 环境 (Bionic libc)
+          docker pull ghcr.io/termux/termux-docker:latest
 
-          # 2. 编写 C 启动器源码
-          cat > launcher.c << EOF
-          #include <stdio.h>
-          #include <stdlib.h>
-          #include <string.h>
-          #include <unistd.h>
-          #include <sys/stat.h>
-          #include <sys/types.h>
+          # 2. 创建构建脚本
+          cat > build_inside.sh << 'EOF'
+          #!/data/data/com.termux/files/usr/bin/bash
+          set -e
 
-          #define FOOTER_SIZE 14
-          // 这里的 PAYLOAD_SIZE 只是占位逻辑，实际通过读取文件末尾获取
+          echo "🔧 Setting up Termux environment..."
+          # 更新包
+          apt update
+          apt upgrade -y
 
-          int main(int argc, char *argv[]) {
-              // 清除干扰变量
-              unsetenv("LD_PRELOAD");
+          # 安装编译工具
+          apt install -y python clang binutils patchelf make
 
-              FILE *self = fopen("/proc/self/exe", "rb");
-              if (!self) self = fopen(argv[0], "rb");
-              if (!self) return 1;
+          echo "📦 Installing Nuitka..."
+          pip install nuitka
 
-              // 读取 Footer
-              if (fseek(self, -FOOTER_SIZE, SEEK_END) != 0) return 1;
-              char footer[FOOTER_SIZE + 1];
-              if (fread(footer, 1, FOOTER_SIZE, self) != FOOTER_SIZE) return 1;
-              if (strncmp(footer + 10, "TERM", 4) != 0) return 1;
-              
-              footer[10] = '\0';
-              long payload_size = atol(footer);
+          echo "🚀 Compiling..."
+          cd /work
+          # 找到 py 文件
+          SCRIPT=$(ls *.py | head -n 1)
+          echo "Found script: $SCRIPT"
 
-              // 创建临时目录
-              char tmp_dir_template[] = "/data/data/com.termux/files/usr/tmp/app_XXXXXX";
-              struct stat st;
-              if (stat("/data/data/com.termux/files/usr/tmp", &st) == -1) {
-                  strcpy(tmp_dir_template, "/tmp/app_XXXXXX");
-              }
-              char *tmp_path = mkdtemp(tmp_dir_template);
-              if (!tmp_path) return 1;
+          # 编译 (standalone 模式)
+          python -m nuitka --standalone --output-dir=build_out "$SCRIPT"
 
-              // 提取 Payload
-              fseek(self, -(FOOTER_SIZE + payload_size), SEEK_END);
-              char tar_path[1024];
-              snprintf(tar_path, sizeof(tar_path), "%s/payload.tar.gz", tmp_path);
-              FILE *out_tar = fopen(tar_path, "wb");
-              
-              unsigned char buffer[8192];
-              long bytes_left = payload_size;
-              while (bytes_left > 0) {
-                  size_t to_read = (bytes_left > sizeof(buffer)) ? sizeof(buffer) : bytes_left;
-                  size_t read = fread(buffer, 1, to_read, self);
-                  if (read == 0) break;
-                  fwrite(buffer, 1, read, out_tar);
-                  bytes_left -= read;
-              }
-              fclose(out_tar);
-              fclose(self);
+          # 整理输出
+          cd build_out
+          DIST_DIR=$(ls -d *.dist | head -n 1)
+          mv "$DIST_DIR" app_pkg
+          
+          cd app_pkg
+          BIN_FILE=$(ls *.bin 2>/dev/null | head -n 1)
+          if [ -n "$BIN_FILE" ]; then
+            mv "$BIN_FILE" final_app
+          fi
 
-              // 解压
-              char cmd[2048];
-              snprintf(cmd, sizeof(cmd), "tar -xf \"%s\" -C \"%s\" -m", tar_path, tmp_path);
-              system(cmd);
-
-              // 运行内部脚本 (移交控制权)
-              char run_cmd[4096];
-              snprintf(run_cmd, sizeof(run_cmd), "\"%s/app_pkg/run.sh\"", tmp_path);
-              
-              // 传递参数
-              for (int i = 1; i < argc; i++) {
-                  strcat(run_cmd, " \"");
-                  strcat(run_cmd, argv[i]);
-                  strcat(run_cmd, "\"");
-              }
-              
-              int ret = system(run_cmd);
-
-              // 清理
-              snprintf(cmd, sizeof(cmd), "rm -rf \"%s\"", tmp_path);
-              system(cmd);
-
-              return WEXITSTATUS(ret);
-          }
+          echo "✅ Build complete!"
+          ls -la
           EOF
 
-          # 3. 使用 Android NDK 交叉编译 (关键步骤！)
-          # GitHub Actions 的 ubuntu-latest 预装了 NDK，位于 $ANDROID_NDK_HOME
-          # 如果没有环境变量，尝试常见路径
-          if [ -z "$ANDROID_NDK_HOME" ]; then
-            export ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk-bundle
-          fi
-          
-          # 寻找 clang 编译器
-          NDK_TOOLCHAIN=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
-          # 目标: Android API 24 (Android 7.0+), Aarch64
-          CC=$NDK_TOOLCHAIN/aarch64-linux-android24-clang
-          
-          echo "Compiling using NDK: $CC"
-          
-          # 编译！
-          $CC -o final_app launcher.c -O2
+          chmod +x build_inside.sh
 
-      # ----------------------------------------------------------------
-      # 第三步：合体
-      # ----------------------------------------------------------------
-      - name: Combine and Upload
-        run: |
-          # 1. 读取 payload 大小
-          PAYLOAD_SIZE=$(stat -c%s build_out/payload.tar.gz)
-          
-          # 2. 合并
-          cat build_out/payload.tar.gz >> final_app
-          
-          # 3. 写入 Footer (10位大小 + TERM)
-          printf "%010dTERM" $PAYLOAD_SIZE >> final_app
-          
-          ls -lh final_app
-          file final_app
+          # 3. 在 Termux 容器中运行构建
+          docker run --rm \
+            -v "$PWD:/work" \
+            -v "$PWD/build_inside.sh:/build_inside.sh" \
+            ghcr.io/termux/termux-docker:latest \
+            /data/data/com.termux/files/usr/bin/bash /build_inside.sh
+
+          # 4. 打包结果
+          cd build_out/app_pkg
+          tar -czf ../../termux_app.tar.gz .
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: termux_aarch64_hybrid_final
-          path: final_app
+          name: termux_native_build
+          path: termux_app.tar.gz
